@@ -1,0 +1,9 @@
+.rocprofv3/
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.hip
+*_hip.cpp
+*_hip.cuh
+*.so

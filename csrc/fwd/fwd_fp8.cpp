@@ -1,0 +1,257 @@
+#include <hip/hip_runtime.h>
+
+#include "common.h"
+#include "launch_params.h"
+
+#ifndef NO_PYTORCH
+#if defined(__clang__)
+// Thrust emits a gfx1100/gfx1101 clock warning for gfx1151. This code does not use timing APIs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-W#warnings"
+#endif
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/c/shim.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+#endif
+
+#include <climits>
+#include <cstdint>
+
+#ifndef NO_PYTORCH
+
+namespace feather_attn {
+
+namespace {
+
+using Launcher = bool (*)(const LaunchParams&);
+using StridedLauncher = bool (*)(const StridedLaunchParams&);
+
+Launcher SelectFwdFp8Launcher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)
+{
+    if(head_dim == 64)
+    {
+        if(pad_q && pad_kv)
+            return nhd ? feather_attn_fwd_fp8_nhd_d64_query_key_tail
+                       : feather_attn_fwd_fp8_hnd_d64_query_key_tail;
+        if(pad_q)
+            return nhd ? feather_attn_fwd_fp8_nhd_d64_query_tail
+                       : feather_attn_fwd_fp8_hnd_d64_query_tail;
+        if(pad_kv)
+            return nhd ? feather_attn_fwd_fp8_nhd_d64_key_tail
+                       : feather_attn_fwd_fp8_hnd_d64_key_tail;
+        return nhd ? feather_attn_fwd_fp8_nhd_d64_aligned
+                   : feather_attn_fwd_fp8_hnd_d64_aligned;
+    }
+    if(pad_q && pad_kv)
+        return nhd ? feather_attn_fwd_fp8_nhd_d128_query_key_tail
+                   : feather_attn_fwd_fp8_hnd_d128_query_key_tail;
+    if(pad_q)
+        return nhd ? feather_attn_fwd_fp8_nhd_d128_query_tail
+                   : feather_attn_fwd_fp8_hnd_d128_query_tail;
+    if(pad_kv)
+        return nhd ? feather_attn_fwd_fp8_nhd_d128_key_tail
+                   : feather_attn_fwd_fp8_hnd_d128_key_tail;
+    return nhd ? feather_attn_fwd_fp8_nhd_d128_aligned
+               : feather_attn_fwd_fp8_hnd_d128_aligned;
+}
+
+int64_t ResolveNhdHeadGroupSize(int64_t heads, int64_t n_kv, int64_t head_dim)
+{
+    if(head_dim != 128)
+        return heads;
+
+    constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
+    const __int128 kv_bytes_per_head =
+        static_cast<__int128>(n_kv) * head_dim * 2 * sizeof(uint16_t);
+    const __int128 total_kv_bytes = static_cast<__int128>(heads) * kv_bytes_per_head;
+    if(total_kv_bytes * 2 < kLlcBytes * 3 || kv_bytes_per_head > kLlcBytes)
+        return heads;
+
+    const int64_t group_size = static_cast<int64_t>(kLlcBytes / kv_bytes_per_head);
+    if(group_size < 4 || group_size >= heads)
+        return heads;
+    return group_size;
+}
+
+StridedLauncher SelectNhdD64StridedLauncher(bool pad_q, bool pad_kv)
+{
+    if(pad_q && pad_kv)
+        return feather_attn_fwd_fp8_nhd_d64_strided_query_key_tail;
+    if(pad_q)
+        return feather_attn_fwd_fp8_nhd_d64_strided_query_tail;
+    if(pad_kv)
+        return feather_attn_fwd_fp8_nhd_d64_strided_key_tail;
+    return feather_attn_fwd_fp8_nhd_d64_strided_aligned;
+}
+
+} // namespace
+
+void AttnFp16Feather(
+    const torch::stable::Tensor& q,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    torch::stable::Tensor& o,
+    int64_t layout)
+{
+    STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && o.is_cuda(),
+                    "q, k, v, and o must be CUDA tensors");
+    const auto device_index = q.get_device_index();
+    STD_TORCH_CHECK(k.get_device_index() == device_index &&
+                        v.get_device_index() == device_index &&
+                        o.get_device_index() == device_index,
+                    "q, k, v, and o must be on the same device");
+    STD_TORCH_CHECK(q.scalar_type() == torch::stable::ScalarType::Half &&
+                        k.scalar_type() == torch::stable::ScalarType::Half &&
+                        v.scalar_type() == torch::stable::ScalarType::Half &&
+                        o.scalar_type() == torch::stable::ScalarType::Half,
+                    "q, k, v, and o must be float16");
+    STD_TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && o.dim() == 4,
+                    "q, k, v, and o must be 4D");
+
+    STD_TORCH_CHECK(layout == 0 || layout == 1,
+                    "layout must be 0 (HND) or 1 (NHD)");
+    const bool nhd      = layout == 1;
+    const int64_t batch = q.size(0);
+    const int64_t heads = q.size(nhd ? 2 : 1);
+    const int64_t n_q   = q.size(nhd ? 1 : 2);
+    const int64_t d     = q.size(3);
+    const int64_t n_kv  = k.size(nhd ? 1 : 2);
+    STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
+                    "batch, heads, N_Q, and N_KV must be positive");
+    STD_TORCH_CHECK(d == 64 || d == 128, "head dimension must be 64 or 128");
+    STD_TORCH_CHECK(k.size(0) == batch && v.size(0) == batch && o.size(0) == batch,
+                    "batch size mismatch");
+    const int64_t head_axis = nhd ? 2 : 1;
+    const int64_t seq_axis  = nhd ? 1 : 2;
+    STD_TORCH_CHECK(k.size(head_axis) == heads &&
+                        v.size(head_axis) == heads &&
+                        o.size(head_axis) == heads,
+                    "head count mismatch");
+    STD_TORCH_CHECK(k.size(3) == d && v.size(3) == d && o.size(3) == d,
+                    "head dimension mismatch");
+    STD_TORCH_CHECK(v.size(seq_axis) == n_kv && o.size(seq_axis) == n_q,
+                    "sequence length mismatch");
+    STD_TORCH_CHECK(IsContiguousND(q, 4) && IsContiguousND(k, 4) &&
+                        IsContiguousND(v, 4) && IsContiguousND(o, 4),
+                    "q, k, v, and o must be contiguous");
+    STD_TORCH_CHECK(IsInt32Addressable(q, sizeof(uint16_t)) &&
+                        IsInt32Addressable(k, sizeof(uint16_t)) &&
+                        IsInt32Addressable(v, sizeof(uint16_t)) &&
+                        IsInt32Addressable(o, sizeof(uint16_t)),
+                    "q, k, v, or o exceeds the signed-int32 byte-offset contract");
+    STD_TORCH_CHECK(batch <= INT32_MAX && heads <= INT32_MAX &&
+                        n_q <= INT32_MAX && n_kv <= INT32_MAX,
+                    "batch, heads, N_Q, or N_KV exceeds signed int32");
+
+    const __int128 q_tiles = n_q / 128 + (n_q % 128 != 0);
+    const __int128 grid_size = static_cast<__int128>(batch) * heads * q_tiles;
+    STD_TORCH_CHECK(grid_size > 0 && grid_size <= UINT32_MAX,
+                    "launch grid exceeds unsigned int32");
+
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+    const int64_t group_size = nhd ? ResolveNhdHeadGroupSize(heads, n_kv, d) : heads;
+    const int64_t strided_group_count =
+        nhd && d == 64 ? ResolveNhdD64StridedGroupCount(heads, n_kv) : 1;
+    const bool use_strided_d64 = strided_group_count > 1;
+    const Launcher launcher =
+        SelectFwdFp8Launcher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0);
+    const StridedLauncher strided_launcher =
+        use_strided_d64 ? SelectNhdD64StridedLauncher(n_q % 128 != 0, n_kv % 64 != 0)
+                        : nullptr;
+
+    (void)hipGetLastError();
+    bool launched = true;
+    if(use_strided_d64)
+    {
+        STD_TORCH_CHECK(strided_group_count <= INT32_MAX,
+                        "strided head-group count exceeds signed int32");
+        for(int64_t group_index = 0; group_index < strided_group_count;
+            ++group_index)
+        {
+            const int64_t launch_heads =
+                (heads - 1 - group_index) / strided_group_count + 1;
+            const __int128 grouped_grid_size =
+                static_cast<__int128>(batch) * launch_heads * q_tiles;
+            STD_TORCH_CHECK(launch_heads > 0 && launch_heads <= INT32_MAX &&
+                                grouped_grid_size <= UINT32_MAX,
+                            "strided head-group launch exceeds device limits");
+            const StridedLaunchParams params{
+                q.const_data_ptr(),
+                k.const_data_ptr(),
+                v.const_data_ptr(),
+                o.mutable_data_ptr(),
+                static_cast<int32_t>(n_q),
+                static_cast<int32_t>(n_kv),
+                static_cast<int32_t>(heads),
+                static_cast<int32_t>(group_index),
+                static_cast<int32_t>(launch_heads),
+                static_cast<int32_t>(strided_group_count),
+                static_cast<uint32_t>(grouped_grid_size),
+                stream};
+            if(!strided_launcher(params))
+            {
+                launched = false;
+                break;
+            }
+        }
+    }
+    else
+    {
+        for(int64_t head_start = 0; head_start < heads; head_start += group_size)
+        {
+            const int64_t launch_heads =
+                group_size < heads - head_start ? group_size : heads - head_start;
+            const __int128 grouped_grid_size =
+                static_cast<__int128>(batch) * launch_heads * q_tiles;
+            const LaunchParams params{
+                q.const_data_ptr(),
+                k.const_data_ptr(),
+                v.const_data_ptr(),
+                o.mutable_data_ptr(),
+                static_cast<int32_t>(n_q),
+                static_cast<int32_t>(n_kv),
+                static_cast<int32_t>(heads),
+                static_cast<int32_t>(head_start),
+                static_cast<int32_t>(launch_heads),
+                static_cast<uint32_t>(grouped_grid_size),
+                stream};
+            if(!launcher(params))
+            {
+                launched = false;
+                break;
+            }
+        }
+    }
+    const hipError_t launch_error = hipGetLastError();
+    STD_TORCH_CHECK(launched && launch_error == hipSuccess,
+                    "FeatherAttn launch failed: ",
+                    hipGetErrorString(launch_error));
+}
+
+} // namespace feather_attn
+
+STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
+{
+    m.def(
+        "attn_fp16_feather("
+        "Tensor q, "
+        "Tensor k, "
+        "Tensor v, "
+        "Tensor(a!) out, "
+        "int layout"
+        ") -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
+{
+    m.impl("attn_fp16_feather", TORCH_BOX(&feather_attn::AttnFp16Feather));
+}
+
+#endif // NO_PYTORCH
