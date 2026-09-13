@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feather-attn"
+version = "0.1.0"
+description = "Fast attention for RDNA3/3.5"
+readme = "README.md"
+license = "MIT"
+authors = [{name = "woctordho", email = "woctordho@outlook.com"}]
+requires-python = ">=3.10"
+# We deliberately avoid declaring torch as a dependency because it's nontrivial to install
+dependencies = []
+
+[tool.ruff]
+line-length = 180
+target-version = "py310"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ty.analysis]
+replace-imports-with-any = ["aiter", "aiter.**", "triton", "triton.**"]
+
+[tool.ty.environment]
+python-version = "3.10"
