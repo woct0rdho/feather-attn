@@ -91,7 +91,7 @@ class _FeatherAttentionFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         out = _feather_attn(q, k, v, layout=layout)
 
-        if ctx.needs_input_grad:
+        if any(ctx.needs_input_grad):
             inv_sqrt_d = head_dim_padded ** -0.5
             if layout == "HND":  # q, k are [B, H, L, D]
                 scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * inv_sqrt_d

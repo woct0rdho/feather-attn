@@ -63,6 +63,7 @@ extern "C" bool feather_attn_hnd_d64_aligned(const LaunchParams& params);
 extern "C" bool feather_attn_hnd_d128_aligned(const LaunchParams& params);
 extern "C" bool feather_attn_nhd_d64_aligned(const LaunchParams& params);
 extern "C" bool feather_attn_nhd_d128_aligned(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d128_aligned_bm256(const LaunchParams& params);
 extern "C" bool feather_attn_hnd_d64_query_tail(const LaunchParams& params);
 extern "C" bool feather_attn_hnd_d128_query_tail(const LaunchParams& params);
 extern "C" bool feather_attn_nhd_d64_query_tail(const LaunchParams& params);

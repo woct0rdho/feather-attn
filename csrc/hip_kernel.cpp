@@ -89,6 +89,27 @@ using Launcher = bool (*)(const feather_attn::LaunchParams&);
 using StridedLauncher =
     bool (*)(const feather_attn::StridedLaunchParams&);
 
+// gfx1103 (Radeon 780M) is a low-CU, 2MB-L2 part where D128 NHD reductions
+// over the full K/V are DRAM-bandwidth bound. Larger query tiles amortize the
+// K/V reads. The 256-row kernel is only selected here, on this architecture;
+// gfx115x and all other configs keep the original launcher.
+bool IsGfx1103(int64_t device_index)
+{
+    static thread_local int64_t cached_device = -1;
+    static thread_local bool cached_is_gfx1103 = false;
+    if(cached_device == device_index)
+        return cached_is_gfx1103;
+    hipDeviceProp_t props{};
+    if(hipGetDeviceProperties(&props, static_cast<int>(device_index)) != hipSuccess)
+        return false;
+    cached_device         = device_index;
+    cached_is_gfx1103     = props.gcnArchName[0] == 'g' && props.gcnArchName[1] == 'f' &&
+                    props.gcnArchName[2] == 'x' && props.gcnArchName[3] == '1' &&
+                    props.gcnArchName[4] == '1' && props.gcnArchName[5] == '0' &&
+                    props.gcnArchName[6] == '3';
+    return cached_is_gfx1103;
+}
+
 Launcher SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)
 {
     if(head_dim == 64)
@@ -252,8 +273,14 @@ void AttnFp16Feather(
     const int64_t strided_group_count =
         nhd && d == 64 ? ResolveNhdD64StridedGroupCount(heads, n_kv) : 1;
     const bool use_strided_d64 = strided_group_count > 1;
+    const bool use_bm256 =
+        nhd && d == 128 && n_q % 256 == 0 && n_q % 128 == 0 && n_kv % 64 == 0 &&
+        batch * heads * q_tiles >= 128 && IsGfx1103(device_index);
+    const int64_t active_q_tiles = use_bm256 ? n_q / 256 : q_tiles;
     const Launcher launcher =
-        SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0);
+        use_bm256
+            ? feather_attn::feather_attn_nhd_d128_aligned_bm256
+            : SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0);
     const StridedLauncher strided_launcher =
         use_strided_d64 ? SelectNhdD64StridedLauncher(n_q % 128 != 0, n_kv % 64 != 0)
                         : nullptr;
@@ -305,9 +332,9 @@ void AttnFp16Feather(
             STD_TORCH_CHECK(
                 ProductFits(UINT32_MAX, static_cast<uint64_t>(batch),
                             static_cast<uint64_t>(launch_heads),
-                            static_cast<uint64_t>(q_tiles)),
+                            static_cast<uint64_t>(active_q_tiles)),
                 "head-group launch exceeds device limits");
-            const int64_t grouped_grid_size = batch * launch_heads * q_tiles;
+            const int64_t grouped_grid_size = batch * launch_heads * active_q_tiles;
             const feather_attn::LaunchParams params{
                 q.const_data_ptr(),
                 k.const_data_ptr(),

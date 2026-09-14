@@ -33,11 +33,11 @@ struct Q8Ops
     static constexpr index_t kLaneRows = 16;
     static constexpr index_t kDPerWmma = 16;
 
-    template <index_t kDTiles>
+    template <index_t kDTiles, index_t kNumWavesValue = kNumWaves>
     CK_TILE_HOST_DEVICE static constexpr auto MakeLdsDescriptor()
     {
         return ck_tile::make_naive_tensor_descriptor_packed(
-            ck_tile::make_tuple(number<kNumWaves>{},
+            ck_tile::make_tuple(number<kNumWavesValue>{},
                                 number<kDTiles>{},
                                 number<kLaneRows>{},
                                 number<kDPerWmma>{}));
@@ -117,16 +117,19 @@ struct SoftmaxOps
     }
 };
 
-template <index_t kHeadDimValue, bool kNHD, bool kPadQ, bool kPadKV>
+template <index_t kHeadDimValue, bool kNHD, bool kPadQ, bool kPadKV,
+          index_t kBlockSizeValue = 256, index_t kBlockMValue = 128,
+          index_t kBlockNValue = 64, bool kCacheQValue = true>
 struct AttentionKernel
 {
     using Wmma = SoftmaxOps::Wmma;
 
-    static constexpr index_t kBlockSize  = 256;
-    static constexpr index_t kBlockM     = 128;
-    static constexpr index_t kBlockN     = 64;
+    static constexpr index_t kBlockSize  = kBlockSizeValue;
+    static constexpr index_t kBlockM     = kBlockMValue;
+    static constexpr index_t kBlockN     = kBlockNValue;
     static constexpr index_t kHeadDim    = kHeadDimValue;
     static constexpr index_t kWaveSize   = 32;
+    static constexpr index_t kNumWaves   = kBlockSize / kWaveSize;
     static constexpr index_t kLaneRows   = 16;
     static constexpr index_t kDPerWmma   = 16;
     static constexpr index_t kDTiles     = kHeadDim / kDPerWmma;
@@ -139,7 +142,9 @@ struct AttentionKernel
     static constexpr index_t kVPack      = 8;
     static constexpr index_t kVChunks    = kBlockN / kVPack;
     static constexpr index_t kCachedQTiles =
-        kHeadDim == 64 && !kNHD ? (kPadKV && !kPadQ ? 3 : kDTiles) : 0;
+        (kHeadDim == 64 && !kNHD && kCacheQValue)
+            ? (kPadKV && !kPadQ ? 3 : kDTiles)
+            : 0;
 
     struct Kargs
     {
@@ -192,7 +197,8 @@ struct AttentionKernel
 
     CK_TILE_DEVICE void operator()(Kargs kargs) const
     {
-        constexpr auto q_lds_desc = Q8Ops::MakeLdsDescriptor<kDTiles>();
+        constexpr auto q_lds_desc =
+            Q8Ops::MakeLdsDescriptor<kDTiles, kNumWaves>();
         alignas(16) __shared__ uint8_t lds[kLdsBytes];
         uint8_t* const q_lds  = lds;
         uint8_t* const kv_lds = lds + kQLdsBytes;
@@ -414,9 +420,12 @@ struct AttentionKernel
             asm volatile("v_mov_b32 %0, %1" : "=v"(kv_lane_row) : "v"(lane_row));
             constexpr index_t kVDChunks = kHeadDim / kVPack;
             constexpr index_t kVDGroups = kLaneRows / kVDChunks;
-            constexpr index_t kVRowsPerLane = 4 / kVDGroups;
+            constexpr index_t kVRowsPerLane =
+                kBlockN * kHeadDim / (8 * kBlockSize);
             constexpr index_t kVColsPerLane = 8;
-            const index_t v_n_base = wave * 8 + lane_group * (kVRowsPerLane * kVDGroups) +
+            constexpr index_t kWRowsPerWave = kBlockN * kWaveSize / kBlockSize;
+            const index_t v_n_base = wave * kWRowsPerWave +
+                                     lane_group * (kVRowsPerLane * kVDGroups) +
                                      (lane_row / kVDChunks) * kVRowsPerLane;
             const index_t v_d_base = (lane_row % kVDChunks) * kVColsPerLane;
             ck_tile::fp16x8_t v_rows[kVRowsPerLane] = {};
@@ -540,11 +549,14 @@ bool LaunchVariant(const StridedLaunchParams& params)
     return hipPeekAtLastError() == hipSuccess;
 }
 #else
-template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
+template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV,
+          index_t kBlockSizeValue = 256, index_t kBlockMValue = 128,
+          index_t kBlockNValue = 64, bool kCacheQValue = true>
 bool LaunchVariant(const LaunchParams& params)
 {
     static_assert(kHeadDim == 64 || kHeadDim == 128);
-    using Kernel = AttentionKernel<kHeadDim, kNHD, kPadQ, kPadKV>;
+    using Kernel = AttentionKernel<kHeadDim, kNHD, kPadQ, kPadKV, kBlockSizeValue,
+                                   kBlockMValue, kBlockNValue, kCacheQValue>;
     constexpr float q_scale_log2 =
         kHeadDim == 64 ? 0.18033688011112042f : 0.12751743082459868f;
     const typename Kernel::Kargs kargs{

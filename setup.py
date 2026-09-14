@@ -14,6 +14,7 @@ SOURCES = [
     "csrc/featherattn_bwd_fused_d64.cu",
     "csrc/featherattn_bwd_fused_d128.cu",
     "csrc/featherattn_fwd_aligned.cu",
+    "csrc/featherattn_fwd_aligned_bm256.cu",
     "csrc/featherattn_fwd_query_tail.cu",
     "csrc/featherattn_fwd_key_tail.cu",
     "csrc/featherattn_fwd_query_key_tail.cu",
