@@ -7,12 +7,17 @@
 
 #if defined(_WIN32)
 #include <__clang_hip_math.h>
-#endif
+// Composable Kernel does not support Windows. Provide the small subset of the
+// CK-Tile API the kernels need via a local shim so the Windows build only
+// depends on the HIP/clang toolchain shipped with the ROCm distribution.
+#include "featherattn_ck_shim.h"
+#else
 #include <ck_tile/core.hpp>
 #include <ck_tile/host/kernel_launch.hpp>
 #include <ck_tile/ops/gemm/warp/warp_gemm_attribute_mfma.hpp>
 #include <ck_tile/ops/gemm/warp/warp_gemm_params.hpp>
 #include <ck_tile/ops/gemm/warp/warp_wmma_gemm.hpp>
+#endif
 
 #include <cstdint>
 

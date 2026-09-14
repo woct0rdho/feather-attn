@@ -1,15 +1,23 @@
 from itertools import product
 
+import sys
+
 import pytest
 import torch
 
 from feather_attn import feather_attn
 
-flash_attn_amd = pytest.importorskip(
-    "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
-    reason="AITER is required as the attention reference",
-)
-flash_attn_2 = flash_attn_amd.flash_attn_2
+try:
+    flash_attn_amd = pytest.importorskip(
+        "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
+        reason="AITER is required as the attention reference",
+    )
+except BaseException:
+    if sys.platform == "win32":
+        flash_attn_amd = None
+    else:
+        raise
+flash_attn_2 = getattr(flash_attn_amd, "flash_attn_2", None)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU is required")
 
 BATCH = 1
@@ -83,6 +91,10 @@ def _contract_cases() -> tuple[object, ...]:
 
 
 def _aiter_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str) -> torch.Tensor:
+    if flash_attn_2 is None:
+        from reference_attention import exact_forward
+
+        return exact_forward(q, k, v, layout)
     if layout == "HND":
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)

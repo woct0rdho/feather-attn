@@ -1,4 +1,8 @@
+#if defined(_MSC_VER)
+#include <hip/hip_runtime_api.h>
+#else
 #include <hip/hip_runtime.h>
+#endif
 
 #include "hip_kernel.h"
 
@@ -28,32 +32,57 @@ using half_bits_t = uint16_t;
 
 bool IsContiguous4D(const torch::stable::Tensor& tensor)
 {
-    __int128 expected_stride = 1;
+    uint64_t expected_stride = 1;
     for(int64_t dim = 3; dim >= 0; --dim)
     {
-        if(expected_stride > INT64_MAX)
+        const uint64_t size = static_cast<uint64_t>(tensor.size(dim));
+        if(size != 1 &&
+           static_cast<uint64_t>(tensor.stride(dim)) != expected_stride)
             return false;
-        if(tensor.size(dim) != 1 &&
-           tensor.stride(dim) != static_cast<int64_t>(expected_stride))
+        if(size != 0 && expected_stride > UINT64_MAX / size)
             return false;
-        expected_stride *= tensor.size(dim);
+        expected_stride *= size > 0 ? size : 1;
     }
     return true;
 }
 
 bool IsInt32HalfAddressable(const torch::stable::Tensor& tensor)
 {
-    __int128 max_element_offset = 0;
+    uint64_t max_element_offset = 0;
     for(int64_t dim = 0; dim < 4; ++dim)
     {
         const int64_t stride = tensor.stride(dim);
         if(stride < 0 || stride > INT32_MAX)
             return false;
-        max_element_offset +=
-            static_cast<__int128>(tensor.size(dim) - 1) * stride;
+        const uint64_t span =
+            static_cast<uint64_t>(tensor.size(dim)) - 1;
+        if(span != 0)
+        {
+            const uint64_t step = static_cast<uint64_t>(stride);
+            if(step != 0 && span > UINT64_MAX / step)
+                return false;
+            const uint64_t add = step == 0 ? 0 : span * step;
+            if(max_element_offset > UINT64_MAX - add)
+                return false;
+            max_element_offset += add;
+        }
     }
-    return max_element_offset * static_cast<int64_t>(sizeof(half_bits_t)) <=
-           INT32_MAX;
+    return max_element_offset <= INT32_MAX / static_cast<uint64_t>(sizeof(half_bits_t));
+}
+
+// Returns true when the product of the (non-negative) factors does not exceed
+// `limit`, without relying on wide-integer types. MSVC does not provide
+// __int128, so overflow is avoided via division checks.
+bool ProductFits(uint64_t limit, uint64_t a, uint64_t b, uint64_t c)
+{
+    if(a > limit || b > limit || c > limit)
+        return false;
+    if(a != 0 && b > limit / a)
+        return false;
+    const uint64_t ab = a * b;
+    if(ab != 0 && c > limit / ab)
+        return false;
+    return true;
 }
 
 using Launcher = bool (*)(const feather_attn::LaunchParams&);
@@ -94,35 +123,43 @@ int64_t ResolveNhdHeadGroupSize(int64_t heads, int64_t n_kv, int64_t head_dim)
     if(head_dim != 128)
         return heads;
 
-    constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
-    const __int128 kv_bytes_per_head =
-        static_cast<__int128>(n_kv) * head_dim * 2 * sizeof(half_bits_t);
-    const __int128 total_kv_bytes = static_cast<__int128>(heads) * kv_bytes_per_head;
-    if(total_kv_bytes * 2 < kLlcBytes * 3 || kv_bytes_per_head > kLlcBytes)
+    constexpr uint64_t kLlcBytes = 32ull * 1024 * 1024;
+    const uint64_t kv_bytes_per_head =
+        static_cast<uint64_t>(n_kv) * head_dim * 2 * sizeof(half_bits_t);
+    if(kv_bytes_per_head == 0 || kv_bytes_per_head > kLlcBytes)
         return heads;
 
-    const int64_t group_size = static_cast<int64_t>(kLlcBytes / kv_bytes_per_head);
-    if(group_size < 4 || group_size >= heads)
+    constexpr uint64_t kTotalLimit = kLlcBytes * 3 / 2;
+    const uint64_t heads_u = static_cast<uint64_t>(heads);
+    if(heads_u <= (kTotalLimit - 1) / kv_bytes_per_head)
         return heads;
-    return group_size;
+
+    const uint64_t group_size = kLlcBytes / kv_bytes_per_head;
+    if(group_size < 4 || group_size >= heads_u)
+        return heads;
+    return static_cast<int64_t>(group_size);
 }
 
 int64_t ResolveNhdD64StridedGroupCount(int64_t heads, int64_t n_kv)
 {
-    constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
+    constexpr uint64_t kLlcBytes = 32ull * 1024 * 1024;
     constexpr int64_t kHeadDim  = 64;
-    const __int128 kv_bytes_per_head =
-        static_cast<__int128>(n_kv) * kHeadDim * 2 * sizeof(half_bits_t);
-    const __int128 total_kv_bytes =
-        static_cast<__int128>(heads) * kv_bytes_per_head;
-    if(total_kv_bytes * 2 < kLlcBytes * 3 || kv_bytes_per_head > kLlcBytes)
+    const uint64_t kv_bytes_per_head =
+        static_cast<uint64_t>(n_kv) * kHeadDim * 2 * sizeof(half_bits_t);
+    if(kv_bytes_per_head == 0 || kv_bytes_per_head > kLlcBytes)
         return 1;
 
-    const int64_t group_size = static_cast<int64_t>(kLlcBytes / kv_bytes_per_head);
-    if(group_size < 4 || group_size >= heads)
+    constexpr uint64_t kTotalLimit = kLlcBytes * 3 / 2;
+    const uint64_t heads_u = static_cast<uint64_t>(heads);
+    if(heads_u <= (kTotalLimit - 1) / kv_bytes_per_head)
         return 1;
 
-    int64_t group_count = (heads + group_size - 1) / group_size;
+    const uint64_t group_size = kLlcBytes / kv_bytes_per_head;
+    if(group_size < 4 || group_size >= heads_u)
+        return 1;
+
+    int64_t group_count = (heads + static_cast<int64_t>(group_size) - 1) /
+                          static_cast<int64_t>(group_size);
     if(group_count < 3)
         return 1;
     // A physical-head stride divisible by eight recreates the NHD partition cliff.
@@ -199,10 +236,13 @@ void AttnFp16Feather(
                         n_q <= INT32_MAX && n_kv <= INT32_MAX,
                     "batch, heads, N_Q, or N_KV exceeds signed int32");
 
-    const __int128 q_tiles = n_q / 128 + (n_q % 128 != 0);
-    const __int128 grid_size = static_cast<__int128>(batch) * heads * q_tiles;
-    STD_TORCH_CHECK(grid_size > 0 && grid_size <= UINT32_MAX,
-                    "launch grid exceeds unsigned int32");
+    const int64_t q_tiles = n_q / 128 + (n_q % 128 != 0);
+    STD_TORCH_CHECK(
+        q_tiles > 0 && q_tiles <= UINT32_MAX &&
+            ProductFits(UINT32_MAX, static_cast<uint64_t>(batch),
+                        static_cast<uint64_t>(heads),
+                        static_cast<uint64_t>(q_tiles)),
+        "launch grid exceeds unsigned int32");
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
     void* raw_stream = nullptr;
@@ -229,11 +269,13 @@ void AttnFp16Feather(
         {
             const int64_t launch_heads =
                 (heads - 1 - group_index) / strided_group_count + 1;
-            const __int128 grouped_grid_size =
-                static_cast<__int128>(batch) * launch_heads * q_tiles;
-            STD_TORCH_CHECK(launch_heads > 0 && launch_heads <= INT32_MAX &&
-                                grouped_grid_size <= UINT32_MAX,
-                            "strided head-group launch exceeds device limits");
+            STD_TORCH_CHECK(
+                launch_heads > 0 && launch_heads <= INT32_MAX &&
+                    ProductFits(UINT32_MAX, static_cast<uint64_t>(batch),
+                                static_cast<uint64_t>(launch_heads),
+                                static_cast<uint64_t>(q_tiles)),
+                "strided head-group launch exceeds device limits");
+            const int64_t grouped_grid_size = batch * launch_heads * q_tiles;
             const feather_attn::StridedLaunchParams params{
                 q.const_data_ptr(),
                 k.const_data_ptr(),
@@ -260,8 +302,12 @@ void AttnFp16Feather(
         {
             const int64_t launch_heads =
                 group_size < heads - head_start ? group_size : heads - head_start;
-            const __int128 grouped_grid_size =
-                static_cast<__int128>(batch) * launch_heads * q_tiles;
+            STD_TORCH_CHECK(
+                ProductFits(UINT32_MAX, static_cast<uint64_t>(batch),
+                            static_cast<uint64_t>(launch_heads),
+                            static_cast<uint64_t>(q_tiles)),
+                "head-group launch exceeds device limits");
+            const int64_t grouped_grid_size = batch * launch_heads * q_tiles;
             const feather_attn::LaunchParams params{
                 q.const_data_ptr(),
                 k.const_data_ptr(),
@@ -309,15 +355,16 @@ namespace {
 
 bool IsContiguous3D(const torch::stable::Tensor& tensor)
 {
-    __int128 expected_stride = 1;
+    uint64_t expected_stride = 1;
     for(int64_t dim = 2; dim >= 0; --dim)
     {
-        if(expected_stride > INT64_MAX)
+        const uint64_t size = static_cast<uint64_t>(tensor.size(dim));
+        if(size != 1 &&
+           static_cast<uint64_t>(tensor.stride(dim)) != expected_stride)
             return false;
-        if(tensor.size(dim) != 1 &&
-           tensor.stride(dim) != static_cast<int64_t>(expected_stride))
+        if(size != 0 && expected_stride > UINT64_MAX / size)
             return false;
-        expected_stride *= tensor.size(dim);
+        expected_stride *= size > 0 ? size : 1;
     }
     return true;
 }
@@ -326,16 +373,28 @@ bool IsInt32Addressable(
     const torch::stable::Tensor& tensor,
     int64_t element_size)
 {
-    __int128 max_element_offset = 0;
+    uint64_t max_element_offset = 0;
     for(int64_t dim = 0; dim < tensor.dim(); ++dim)
     {
         const int64_t stride = tensor.stride(dim);
         if(stride < 0 || stride > INT32_MAX)
             return false;
-        max_element_offset +=
-            static_cast<__int128>(tensor.size(dim) - 1) * stride;
+        const uint64_t span =
+            static_cast<uint64_t>(tensor.size(dim)) - 1;
+        if(span != 0)
+        {
+            const uint64_t step = static_cast<uint64_t>(stride);
+            if(step != 0 && span > UINT64_MAX / step)
+                return false;
+            const uint64_t add = step == 0 ? 0 : span * step;
+            if(max_element_offset > UINT64_MAX - add)
+                return false;
+            max_element_offset += add;
+        }
     }
-    return max_element_offset * element_size <= INT32_MAX;
+    return static_cast<uint64_t>(element_size) != 0 &&
+           max_element_offset <=
+               INT32_MAX / static_cast<uint64_t>(element_size);
 }
 
 } // namespace
@@ -469,14 +528,17 @@ void AttnBwdFp16Feather(
     STD_TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0.0,
                     "softmax_scale must be finite and positive");
 
-    const __int128 head_count = static_cast<__int128>(batch) * heads;
-    const __int128 q_rows = head_count * n_q;
-    const __int128 kv_rows = head_count * n_kv;
-    const __int128 q_elements = q_rows * head_dim;
-    const __int128 kv_elements = kv_rows * head_dim;
-    STD_TORCH_CHECK(head_count <= INT32_MAX && q_rows <= INT32_MAX &&
-                        kv_rows <= INT32_MAX && q_elements <= INT32_MAX &&
-                        kv_elements <= INT32_MAX,
+    const int64_t head_count = batch * heads;
+    STD_TORCH_CHECK(head_count > 0 && head_count <= INT32_MAX,
+                    "backward tensor size exceeds signed int32");
+    const int64_t q_rows = head_count * n_q;
+    const int64_t kv_rows = head_count * n_kv;
+    STD_TORCH_CHECK(q_rows > 0 && q_rows <= INT32_MAX &&
+                        kv_rows > 0 && kv_rows <= INT32_MAX,
+                    "backward tensor size exceeds signed int32");
+    const int64_t q_elements = q_rows * head_dim;
+    const int64_t kv_elements = kv_rows * head_dim;
+    STD_TORCH_CHECK(q_elements <= INT32_MAX && kv_elements <= INT32_MAX,
                     "backward tensor size exceeds signed int32");
     int64_t nhd_group_count =
         nhd && head_dim == 64 ? ResolveNhdD64StridedGroupCount(heads, n_kv)

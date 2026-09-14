@@ -1,15 +1,23 @@
 from itertools import product
 
+import sys
+
 import pytest
 import torch
 
 from feather_attn import feather_attn_backward
 
-flash_attn_amd = pytest.importorskip(
-    "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
-    reason="AITER is required to construct the saved forward state",
-)
-flash_attn_2 = flash_attn_amd.flash_attn_2
+try:
+    flash_attn_amd = pytest.importorskip(
+        "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
+        reason="AITER is required to construct the saved forward state",
+    )
+except BaseException:
+    if sys.platform == "win32":
+        flash_attn_amd = None
+    else:
+        raise
+flash_attn_2 = getattr(flash_attn_amd, "flash_attn_2", None)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU is required")
 
 LAYOUTS = ("HND", "NHD")
@@ -91,6 +99,21 @@ def _saved_state(
     v_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=torch.float16, generator=generator)
     dout_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=torch.float16, generator=generator)
     scale = head_dim**-0.5
+    if flash_attn_2 is None:
+        from reference_attention import exact_out_lse
+
+        out_hnd, lse_hnd = exact_out_lse(q_hnd, k_hnd, v_hnd, "HND", scale=scale)
+        if layout == "HND":
+            return q_hnd, k_hnd, v_hnd, out_hnd, lse_hnd.contiguous(), dout_hnd, scale
+        return (
+            q_hnd.transpose(1, 2).contiguous(),
+            k_hnd.transpose(1, 2).contiguous(),
+            v_hnd.transpose(1, 2).contiguous(),
+            out_hnd.transpose(1, 2).contiguous(),
+            lse_hnd.contiguous(),
+            dout_hnd.transpose(1, 2).contiguous(),
+            scale,
+        )
     out_bshd, lse, _, _ = flash_attn_2.fwd(
         q_hnd.transpose(1, 2),
         k_hnd.transpose(1, 2),

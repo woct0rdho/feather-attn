@@ -7,3 +7,4 @@ dist/
 *_hip.cpp
 *_hip.cuh
 *.so
+*.pyd
