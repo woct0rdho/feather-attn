@@ -1,7 +1,6 @@
 import torch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
-from .aiter_tuning import install_aiter_tuned_configs
+from .kernels import bwd_aiter_out, fwd_out
 
 
 def feather_attn(
@@ -56,63 +55,62 @@ def _use_force_hnd_backward(
     return n_q >= min_seq_len
 
 
-def _force_hnd_backward(
+def _is_bhsd_contiguous(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor) -> bool:
+    # A generator expression here breaks Dynamo tracing of the autograd Function.
+    for tensor in (q, k, v, out):
+        if not tensor.transpose(1, 2).is_contiguous():
+            return False
+    return True
+
+
+def _feather_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: torch.Tensor,
-    dk: torch.Tensor,
-    dv: torch.Tensor,
-    delta: torch.Tensor,
     softmax_scale: float,
-    fused: bool,
-) -> None:
-    q_hnd = q.transpose(1, 2).contiguous()
-    k_hnd = k.transpose(1, 2).contiguous()
-    v_hnd = v.transpose(1, 2).contiguous()
-    out_hnd = out.transpose(1, 2).contiguous()
-    dout_hnd = dout.transpose(1, 2).contiguous()
-    dq_hnd = torch.empty_like(q_hnd)
-    dk_hnd = torch.empty_like(k_hnd)
-    dv_hnd = torch.empty_like(v_hnd)
-    if fused:
-        dq_acc_hnd = torch.empty_like(q_hnd, dtype=torch.float32)
-        torch.ops.feather_attn.attn_bwd_feather_fused.default(
-            dout_hnd,
-            q_hnd,
-            k_hnd,
-            v_hnd,
-            out_hnd,
-            softmax_lse,
-            dq_hnd,
-            dk_hnd,
-            dv_hnd,
-            delta,
-            dq_acc_hnd,
-            softmax_scale,
-            0,
-        )
+):
+    use_hnd = _is_bhsd_contiguous(q, k, v, out) or _use_force_hnd_backward(q, k, v, out, dout)
+
+    # The fused kernel is only built for head_dim 128, and measured slower than the
+    # split kernels for few heads / short keys.
+    fused = q.shape[-1] == 128 and (use_hnd or q.shape[2] >= 32 or k.shape[1] >= 8192)
+
+    delta = torch.empty(softmax_lse.shape, dtype=torch.float32, device=softmax_lse.device)
+    softmax_lse = softmax_lse.contiguous()
+
+    if use_hnd:
+        dout_h = dout.transpose(1, 2).contiguous()
+        q_h = q.transpose(1, 2).contiguous()
+        k_h = k.transpose(1, 2).contiguous()
+        v_h = v.transpose(1, 2).contiguous()
+        out_h = out.transpose(1, 2).contiguous()
+        dq = torch.empty_like(q_h)
+        dk = torch.empty_like(k_h)
+        dv = torch.empty_like(v_h)
+        if fused:
+            dq_acc = torch.empty_like(q_h, dtype=torch.float32)
+            torch.ops.feather_attn.attn_bwd_feather_fused.default(dout_h, q_h, k_h, v_h, out_h, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 0)
+        else:
+            torch.ops.feather_attn.attn_bwd_feather.default(dout_h, q_h, k_h, v_h, out_h, softmax_lse, dq, dk, dv, delta, softmax_scale, 0)
+        return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), delta
     else:
-        torch.ops.feather_attn.attn_bwd_feather.default(
-            dout_hnd,
-            q_hnd,
-            k_hnd,
-            v_hnd,
-            out_hnd,
-            softmax_lse,
-            dq_hnd,
-            dk_hnd,
-            dv_hnd,
-            delta,
-            softmax_scale,
-            0,
-        )
-    dq.copy_(dq_hnd.transpose(1, 2))
-    dk.copy_(dk_hnd.transpose(1, 2))
-    dv.copy_(dv_hnd.transpose(1, 2))
+        dout = dout.contiguous()
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        out = out.contiguous()
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        if fused:
+            dq_acc = torch.empty_like(q, dtype=torch.float32)
+            torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 1)
+        else:
+            torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, 1)
+        return dq, dk, dv, delta
 
 
 def feather_attn_backward(
@@ -124,53 +122,50 @@ def feather_attn_backward(
     softmax_lse: torch.Tensor,
     softmax_scale: float | None = None,
     layout: str = "NHD",
-    fused: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
     if layout == "HND":
-        layout_id = 0
-    elif layout == "NHD":
-        layout_id = 1
-    else:
-        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout}")
-
-    force_hnd = layout_id == 1 and _use_force_hnd_backward(q, k, v, out, dout)
-    if fused is None:
-        fused = q.shape[-1] == 128
-        if fused and layout == "NHD" and not force_hnd and q.shape[2] < 32 and k.shape[1] < 8192:
-            fused = False
-    if fused and q.shape[-1] != 128:
-        fused = False
-
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-    delta = torch.empty_like(softmax_lse, dtype=torch.float32)
-    softmax_scale = float(softmax_scale)
-    if force_hnd:
-        _force_hnd_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, fused=fused)
-    elif fused and q.shape[-1] == 128:
-        dq_acc = torch.empty_like(q, dtype=torch.float32)
-        torch.ops.feather_attn.attn_bwd_feather_fused.default(
-            dout,
-            q,
-            k,
-            v,
-            out,
+        dq, dk, dv, delta = _feather_backward(
+            dout.transpose(1, 2),
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            out.transpose(1, 2),
             softmax_lse,
-            dq,
-            dk,
-            dv,
-            delta,
-            dq_acc,
-            softmax_scale,
-            layout_id,
+            float(softmax_scale),
         )
-    else:
-        torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, layout_id)
-    return dq, dk, dv, delta
+        return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), delta
+
+    if layout != "NHD":
+        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout}")
+    return _feather_backward(dout, q, k, v, out, softmax_lse, float(softmax_scale))
+
+
+def _supports_feather_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    alibi_slopes: torch.Tensor | None,
+) -> bool:
+    """Features and dtypes both attention kernels accept, independent of the head layout."""
+    return (
+        dropout_p == 0.0
+        and not causal
+        and tuple(window_size) == (-1, -1)
+        and alibi_slopes is None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.shape[-1] in (64, 128)
+    )
+
+
+def _batch_and_head_dim_match(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    return q.shape[0] == k.shape[0] == v.shape[0] and q.shape[-1] == k.shape[-1] == v.shape[-1]
 
 
 def _can_use_feather_backward(
@@ -180,27 +175,12 @@ def _can_use_feather_backward(
     dropout_p: float,
     causal: bool,
     window_size: tuple[int, int],
-    softcap: float,
     alibi_slopes: torch.Tensor | None,
-    deterministic: bool,
 ) -> bool:
-    return (
-        dropout_p == 0.0
-        and not causal
-        and window_size == (-1, -1)
-        and softcap == 0.0
-        and alibi_slopes is None
-        and not deterministic
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == v.dtype
-        and q.shape[0] == k.shape[0] == v.shape[0]
-        and q.shape[2] == k.shape[2] == v.shape[2]
-        and q.shape[-1] == k.shape[-1] == v.shape[-1]
-        and q.shape[-1] in (64, 128)
-    )
+    return _batch_and_head_dim_match(q, k, v) and q.shape[2] == k.shape[2] == v.shape[2] and _supports_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
 
 
-def _aiter_attn_backward(
+def _aiter_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -211,16 +191,13 @@ def _aiter_attn_backward(
     dropout_p: float,
     causal: bool,
     window_size: tuple[int, int],
-    softcap: float,
     alibi_slopes: torch.Tensor | None,
-    deterministic: bool,
-    rng_state: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-    install_aiter_tuned_configs(q.device)
-    flash_attn_2.bwd(
+):
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    delta = torch.zeros_like(softmax_lse, dtype=torch.float32)
+    bwd_aiter_out(
         dout,
         q,
         k,
@@ -230,15 +207,13 @@ def _aiter_attn_backward(
         dq,
         dk,
         dv,
+        delta,
         alibi_slopes,
-        dropout_p,
         softmax_scale,
         causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
-        softcap=softcap,
-        deterministic=deterministic,
-        rng_state=rng_state,
+        window_size[0],
+        window_size[1],
+        dropout_p,
     )
     return dq, dk, dv
 
@@ -254,112 +229,62 @@ class _FeatherAttnFunc(torch.autograd.Function):
         softmax_scale: float | None,
         causal: bool,
         window_size: tuple[int, int],
-        softcap: float,
         alibi_slopes: torch.Tensor | None,
-        deterministic: bool,
         return_attn_probs: bool,
-        is_grad_enabled: bool,
     ):
-        if softcap != 0.0:
-            raise NotImplementedError("AITER FlashAttention Triton forward does not support softcap")
-
-        is_grad = is_grad_enabled and any(tensor.requires_grad for tensor in (q, k, v))
+        is_grad = q.requires_grad or k.requires_grad or v.requires_grad
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         softmax_scale = float(softmax_scale)
+        dropout_p = float(dropout_p)
         window_size = (int(window_size[0]), int(window_size[1]))
-        install_aiter_tuned_configs(q.device)
-        out, softmax_lse, s_dmask, rng_state = flash_attn_2.fwd(
+
+        batch, seqlen_q, nheads_q, _ = q.shape
+        out = torch.empty_like(q)
+        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        needs_scores = return_attn_probs or dropout_p > 0.0
+        sd_mask = torch.zeros((batch, nheads_q, seqlen_q, k.shape[1]), device=q.device, dtype=torch.float32) if needs_scores else None
+        fwd_out(
             q,
             k,
             v,
-            out=None,
-            alibi_slopes=alibi_slopes,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            return_softmax=return_attn_probs or dropout_p > 0.0,
+            out,
+            softmax_lse,
+            sd_mask,
+            alibi_slopes,
+            softmax_scale,
+            causal,
+            window_size[0],
+            window_size[1],
+            dropout_p,
+            return_attn_probs,
         )
 
-        use_feather_backward = is_grad and _can_use_feather_backward(
-            q,
-            k,
-            v,
-            dropout_p,
-            causal,
-            window_size,
-            softcap,
-            alibi_slopes,
-            deterministic,
-        )
+        use_feather_backward = is_grad and _can_use_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
         if use_feather_backward:
             use_feather_backward = out.shape == q.shape and softmax_lse.shape == (q.shape[0], q.shape[2], q.shape[1])
 
         if is_grad:
-            backward_layout = None
-            if use_feather_backward:
-                if all(tensor.transpose(1, 2).is_contiguous() for tensor in (q, k, v, out)):
-                    backward_layout = "HND"
-                    softmax_lse = softmax_lse.contiguous()
-                else:
-                    backward_layout = "NHD"
-                    q = q.contiguous()
-                    k = k.contiguous()
-                    v = v.contiguous()
-                    out = out.contiguous()
-                    softmax_lse = softmax_lse.contiguous()
-            ctx.save_for_backward(q, k, v, out, softmax_lse, rng_state)
+            ctx.save_for_backward(q, k, v, out, softmax_lse)
             ctx.softmax_scale = softmax_scale
             ctx.dropout_p = dropout_p
             ctx.causal = causal
             ctx.window_size = window_size
-            ctx.softcap = softcap
             ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
             ctx.use_feather_backward = use_feather_backward
-            ctx.backward_layout = backward_layout
 
         if return_attn_probs:
-            return out, softmax_lse, s_dmask
+            return out, softmax_lse, sd_mask
         return out
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         dout = grad_outputs[0]
-        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse = ctx.saved_tensors
         if ctx.use_feather_backward:
-            if ctx.backward_layout == "HND":
-                dout = dout.transpose(1, 2).contiguous()
-                dq, dk, dv, _ = feather_attn_backward(
-                    dout,
-                    q.transpose(1, 2),
-                    k.transpose(1, 2),
-                    v.transpose(1, 2),
-                    out.transpose(1, 2),
-                    softmax_lse,
-                    softmax_scale=ctx.softmax_scale,
-                    layout="HND",
-                )
-                dq = dq.transpose(1, 2)
-                dk = dk.transpose(1, 2)
-                dv = dv.transpose(1, 2)
-            else:
-                dout = dout.contiguous()
-                dq, dk, dv, _ = feather_attn_backward(
-                    dout,
-                    q,
-                    k,
-                    v,
-                    out,
-                    softmax_lse,
-                    softmax_scale=ctx.softmax_scale,
-                    layout="NHD",
-                )
+            dq, dk, dv, _ = _feather_backward(dout, q, k, v, out, softmax_lse, ctx.softmax_scale)
         else:
-            dq, dk, dv = _aiter_attn_backward(
+            dq, dk, dv = _aiter_backward(
                 dout,
                 q,
                 k,
@@ -370,10 +295,7 @@ class _FeatherAttnFunc(torch.autograd.Function):
                 ctx.dropout_p,
                 ctx.causal,
                 ctx.window_size,
-                ctx.softcap,
                 ctx.alibi_slopes,
-                ctx.deterministic,
-                rng_state,
             )
         return dq, dk, dv, *((None,) * (len(ctx.needs_input_grad) - 3))
 
@@ -385,29 +307,18 @@ def _expand_gqa_for_feather_backward(
     dropout_p: float,
     causal: bool,
     window_size: tuple[int, int],
-    softcap: float,
     alibi_slopes: torch.Tensor | None,
-    deterministic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if q.shape[2] == k.shape[2]:
-        return k, v
-    if v.shape[2] != k.shape[2] or q.shape[2] % k.shape[2] != 0 or q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1] or k.shape[-1] != v.shape[-1]:
-        return k, v
-    if not (torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v))):
-        return k, v
-    if not (
-        dropout_p == 0.0
-        and not causal
-        and tuple(window_size) == (-1, -1)
-        and softcap == 0.0
-        and alibi_slopes is None
-        and not deterministic
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == v.dtype
-        and q.shape[-1] in (64, 128)
+    group_size = q.shape[2] // k.shape[2]
+    if (
+        q.shape[2] % k.shape[2]
+        or q.shape[2] == k.shape[2]
+        or k.shape[2] != v.shape[2]
+        or not _batch_and_head_dim_match(q, k, v)
+        or not (torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v)))
+        or not _supports_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
     ):
         return k, v
-    group_size = q.shape[2] // k.shape[2]
     return k.repeat_interleave(group_size, dim=2), v.repeat_interleave(group_size, dim=2)
 
 
@@ -431,7 +342,11 @@ def feather_attn_func(
     pass uses the FeatherAttn kernels when the requested features are
     supported, otherwise it falls back to AITER's backward.
     """
-    k, v = _expand_gqa_for_feather_backward(q, k, v, dropout_p, causal, window_size, softcap, alibi_slopes, deterministic)
+    if softcap != 0.0:
+        raise NotImplementedError("softcap is not supported")
+    if deterministic:
+        raise NotImplementedError("deterministic=True is not supported")
+    k, v = _expand_gqa_for_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
     return _FeatherAttnFunc.apply(
         q,
         k,
@@ -440,9 +355,6 @@ def feather_attn_func(
         softmax_scale,
         causal,
         window_size,
-        softcap,
         alibi_slopes,
-        deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
     )

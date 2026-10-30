@@ -31,7 +31,7 @@ Hotspot mapping (from source-loc analysis):
 - `ds_*`: dpT dot 256, dQ dot 256, dK dot 128 - rest from global-load-to-LDS staging.
 - `s_waitcnt`: dQ dot 132, dpT dot 124, dK dot 101 - mostly `lgkmcnt` waits.
 - `scratch_load`/`scratch_store`: concentrated near dpT/qkT/dk dots (dK/dV section).
-- Store-side `v_cmp_o_f32`/`v_cndmask` (64 per store) = fp32->bf16 conversion+NaN canonicalization, *not* residual source masks.
+- Store-side `v_cmp_o_f32`/`v_cndmask` (64 per store) = fp32->bf16 conversion+NaN canonicalization, not residual source masks.
 
 Diagnostic dK/dV-only vs dQ-only split:
 

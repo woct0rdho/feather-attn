@@ -132,7 +132,7 @@ def test_feather_attn_func_gqa_backward_matches_aiter(monkeypatch) -> None:
     def fail_aiter_backward(*args, **kwargs):
         raise AssertionError("GQA should use the FeatherAttn backward")
 
-    monkeypatch.setattr("feather_attn.ops._aiter_attn_backward", fail_aiter_backward)
+    monkeypatch.setattr("feather_attn.ops._aiter_backward", fail_aiter_backward)
     out = feather_attn_func(q, k, v)
     dout = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), dout)
@@ -281,7 +281,7 @@ def test_feather_attn_func_physical_bhsd_uses_hnd_without_layout_copy(head_dim: 
     q = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
     k = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
     v = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
-    with patch("feather_attn.ops._aiter_attn_backward", side_effect=AssertionError("unexpected AITER fallback")):
+    with patch("feather_attn.ops._aiter_backward", side_effect=AssertionError("unexpected AITER fallback")):
         out = feather_attn_func(q, k, v)
         dout = torch.randn_like(out)
         actual = torch.autograd.grad(out, (q, k, v), dout)

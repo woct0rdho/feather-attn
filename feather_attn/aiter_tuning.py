@@ -1,6 +1,5 @@
 import functools
 
-import torch
 import triton
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, fwd_prefill
 
@@ -27,8 +26,6 @@ _BWD_CAUSAL_TILES: dict[int, tuple] = {
     256: (16, 64, 16, 2, 4, 2, 1),
 }
 _BWD_FALLBACK_TILE = (32, 32, 32, 2, 4, 1, 1)
-
-_INSTALLED_DEVICES: set[int] = set()
 
 
 def _fwd_tile_to_config(tile: tuple) -> triton.Config:
@@ -131,9 +128,7 @@ def _apply_aiter_tuned_configs() -> None:
     )
 
 
-def install_aiter_tuned_configs(device: torch.device) -> None:
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    if device_index in _INSTALLED_DEVICES:
+def install_aiter_tuned_configs() -> None:
+    if fwd_prefill.attn_fwd.early_config_prune is _fwd_early_config_prune:
         return
     _apply_aiter_tuned_configs()
-    _INSTALLED_DEVICES.add(device_index)
