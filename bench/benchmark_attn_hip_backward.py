@@ -17,6 +17,8 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import (
 from feather_attn import feather_attn_backward
 
 BATCH = 1
+DTYPE = torch.float16
+DTYPE_NAME = "fp16"
 HEAD_DIM = 64
 GEMM_COUNT = 7
 BENCHMARK_HEAD_COUNTS = (16, 32, 56)
@@ -46,10 +48,10 @@ def _saved_state(heads: int, seq_len: int, seed: int, layout: str) -> SavedState
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     shape = (BATCH, heads, seq_len, HEAD_DIM) if layout == "HND" else (BATCH, seq_len, heads, HEAD_DIM)
-    q = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    k = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    v = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    dout = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
+    q = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
+    k = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
+    v = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
+    dout = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
     scale = HEAD_DIM**-0.5
     out_bshd, lse, _, _ = flash_attn_2.fwd(
         _bshd(q, layout),
@@ -198,6 +200,7 @@ def _run_shape(
             "heads": heads,
             "seq_len": seq_len,
             "head_dim": HEAD_DIM,
+            "dtype": DTYPE_NAME,
             "layout": layout,
         },
         "seed": seed,
@@ -252,6 +255,7 @@ def _write_result(
         "matrix": {
             "batch": BATCH,
             "head_dim": HEAD_DIM,
+            "dtype": DTYPE_NAME,
             "head_counts": list(BENCHMARK_HEAD_COUNTS),
             "seq_lens": list(SEQ_LENS),
             "layouts": list(LAYOUTS),
@@ -273,7 +277,7 @@ def _write_result(
 
 
 def main() -> None:
-    global HEAD_DIM, GEMM_COUNT
+    global HEAD_DIM, GEMM_COUNT, DTYPE, DTYPE_NAME
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--shapes",
@@ -285,6 +289,7 @@ def main() -> None:
         default=",".join(LAYOUTS),
         help="comma-separated physical layouts (HND and/or NHD)",
     )
+    parser.add_argument("--dtype", choices=("fp16", "bf16"), default=DTYPE_NAME)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=HEAD_DIM)
     parser.add_argument("--gemm-count", type=int, choices=(5, 6, 7, 8), default=GEMM_COUNT)
     parser.add_argument("--warmups", type=int, default=8)
@@ -296,6 +301,8 @@ def main() -> None:
         raise ValueError("warmups must be non-negative and repeats must be positive")
     HEAD_DIM = args.head_dim
     GEMM_COUNT = args.gemm_count
+    DTYPE_NAME = args.dtype
+    DTYPE = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     shapes = _parse_shapes(args.shapes)
     layouts = _parse_layouts(args.layouts)
@@ -303,7 +310,7 @@ def main() -> None:
     rows = []
     for index, (heads, seq_len, layout) in enumerate(benchmark_rows):
         print(
-            f"BEGIN H={heads} N={seq_len} D={HEAD_DIM} layout={layout}",
+            f"BEGIN H={heads} N={seq_len} D={HEAD_DIM} dtype={DTYPE_NAME} layout={layout}",
             flush=True,
         )
         row = _run_shape(

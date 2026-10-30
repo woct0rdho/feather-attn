@@ -6,12 +6,12 @@
 feather_attn_backward(dout, q, k, v, out, softmax_lse, dq=None, dk=None, dv=None, softmax_scale=None, delta=None, layout="NHD")
 ```
 
-- Inputs are contiguous HND `[B,H,N,D]` or NHD `[B,N,H,D]` FP16 tensors.
+- Inputs are contiguous HND `[B,H,N,D]` or NHD `[B,N,H,D]` tensors. Q/K/V/out/dO/dQ/dK/dV must all be FP16 or all BF16.
 - LSE is contiguous FP32 natural-log state in logical `[B,H,NQ]` order.
-- Outputs are FP16 dQ/dK/dV in the input layout and FP32 Delta in logical `[B,H,NQ]` order.
+- Outputs are dQ/dK/dV in the input dtype and layout, plus FP32 Delta in logical `[B,H,NQ]` order.
 - Arbitrary positive query and KV lengths are supported. Runtime guards handle tails. The benchmark shapes are not a support whitelist.
-- D64 is workspace-free and uses direct FP32 WMMA accumulators stored as FP16.
-- D64 direct-NHD and selected-HND results are bit-exact in the dispatch contract.
+- D64 is workspace-free and uses direct FP32 WMMA accumulators stored as FP16 or BF16.
+- D64 direct-NHD and selected-HND results are bit-exact in the dispatch contract for both dtypes.
 - NHD self-attention may use bounded HND transpose routing. All copy and allocation cost is inside the measured call.
 
 ## Current Design
@@ -61,7 +61,7 @@ D64 phase fission requires both `NQ` and `NKV >= 4096`. NHD uses the validated g
 | Main LDS | 13,312 B fused, 26,624 B Q | 31,232 B | 15,616 B |
 | Logical / allocated VGPR | 178/192 fused, 192/192 Q | 176/192 | 176/192 |
 
-D64 stages FP16 K/V in XOR-swizzled LDS rows, uses a 20-half transpose stride, and uses a 72-half row stride for the long KV dO copy. The wide HND KV phase and the Q phase use two-buffer staging and omit the loop-start barrier. Aligned-Q/aligned-KV variants remove inner-loop tail predicates for the benchmark shapes.
+D64 stages 16-bit K/V in XOR-swizzled LDS rows, uses a 20-element transpose stride, and uses a 72-element row stride for the long KV dO copy. FP16 and BF16 share the same LDS geometry. The wide HND KV phase and the Q phase use two-buffer staging and omit the loop-start barrier. Aligned-Q/aligned-KV variants remove inner-loop tail predicates for the benchmark shapes.
 
 ### Linked Resources
 
@@ -74,6 +74,8 @@ D64 stages FP16 K/V in XOR-swizzled LDS rows, uses a 20-half transpose stride, a
 | D64 HND/NHD Q | 192 / 192 | 26,624 B | 0 / 0 / 0 |
 | D64 HND/NHD Delta | 66 / 72 | 0 B | 0 / 0 / 0 |
 
+Resource counts are for the FP16 instantiation. BF16 uses the same LDS layout.
+
 ## Benchmark and Correctness
 
 `bench/benchmark_attn_hip_backward.py` reports `F7`/`F_actual` for D64. D64 executes seven GEMMs, so F7 and F_actual are the same:
@@ -84,6 +86,8 @@ F5 = 5/7 * F7  # reporting cross-check only
 ```
 
 The production matrix uses five warmups and ten repeats, complete provider timing, and the same paired AITER control.
+
+Both dtype instantiations use the same kernel topology. A same-process A/B screen measured BF16/FP16 between `1.01x` and `1.05x` across D64 HND/NHD. No separate BF16 matrix is retained. Use `--dtype bf16` to select BF16 in the benchmark.
 
 ### Production Matrix
 
@@ -112,7 +116,7 @@ Artifact: `~/tmp/feather_attn/d64_plan/final_d64_matrix_delta.json`.
 
 ### Correctness Coverage
 
-The public backward screen is `46/46`, including H `{16,32,56}`, batch two, selector boundaries, and asymmetric lengths through 16,385. D64 direct-NHD and selected-HND remain bit-exact. The forward regression contract is `188/188`.
+The public backward screen is `93/93` across FP16 and BF16, including H `{16,32,56}`, batch two, selector boundaries, and asymmetric lengths through 16,385. D64 direct-NHD and selected-HND remain bit-exact for both dtypes. The forward regression contract is `188/188` (FP16 forward only).
 
 ## Profile and Roofline
 
@@ -217,7 +221,7 @@ D64 is near its practical compute roof. The remaining large candidates are exhau
 - Run the full 18-row matrix after policy changes.
 - Keep generic/tail variants for arbitrary lengths.
 
-- Promotion requires production-equivalent linked gfx1151 code, exact-symbol metadata/disassembly, zero private memory/spills/scratch, correct owner/tail/layout behavior, and a positive complete-path 18-row screen. D64 also keeps the `46/46` backward and `188/188` forward contracts.
+- Promotion requires production-equivalent linked gfx1151 code, exact-symbol metadata/disassembly, zero private memory/spills/scratch, correct owner/tail/layout behavior, and a positive complete-path 18-row screen. D64 also keeps the `93/93` backward and `188/188` forward contracts.
 - Timing uses alternating baseline/candidate blocks, raw samples, per-block ratios, log medians, and paired confidence intervals. Include Delta, Q, KV, allocation, conversion, and copies.
 - Accuracy tiers: directional cosine at least `0.997`. Preferred Rel-L2 at most `0.10`, exploratory below `0.20`. Exact scheduling/layout candidates preserve the elementwise contract.
 - Evidence hierarchy: runtime symbol from `rocprofv3`, linked metadata, exact-symbol disassembly, optimized MIR/pressure, then architecture/byte models. `llvm-readelf` is required for AMDGPU metadata. Virtual, allocated, and simultaneously live registers are distinct quantities.

@@ -6,9 +6,9 @@
 feather_attn_backward(dout, q, k, v, out, softmax_lse, dq=None, dk=None, dv=None, softmax_scale=None, delta=None, layout="NHD")
 ```
 
-- Inputs are contiguous HND `[B,H,N,D]` or NHD `[B,N,H,D]` FP16 tensors.
+- Inputs are contiguous HND `[B,H,N,D]` or NHD `[B,N,H,D]` tensors. Q/K/V/out/dO/dQ/dK/dV must all be FP16 or all BF16.
 - LSE is contiguous FP32 natural-log state in logical `[B,H,NQ]` order.
-- Outputs are FP16 dQ/dK/dV in the input layout and FP32 Delta in logical `[B,H,NQ]` order.
+- Outputs are dQ/dK/dV in the input dtype and layout, plus FP32 Delta in logical `[B,H,NQ]` order.
 - Arbitrary positive query and KV lengths are supported. Tile counts and guards cover tails.
 - D128 allocates a temporary FP32 dQ accumulation tensor in Python. It remains internal and is passed through the private fused operator.
 - The fused path is tolerance-equivalent on dQ because FP32 atomic accumulation changes rounding order. dK/dV/Delta are direct writes and remain bit-exact in paired dispatch checks.
@@ -34,14 +34,14 @@ Phase A:
 - Four wave pairs handle four 16-row KV groups.
 - The even wave computes score. The odd wave computes dP.
 - Score and dP are exchanged through FP32 LDS.
-- P and dS are published as half2 SoA FP16 A-fragment tiles.
+- P and dS are published as 16-bit SoA A-fragment tiles (`half2` for FP16, `bf16x2` for BF16).
 
 Phase B:
 - Eight waves each own one D16 slice.
 - Each wave computes dK and dV for the four KV groups and accumulates dQ over them.
 - dK/dV remain in registers across the Q loop and are stored once.
 - dQ is atomically added to the FP32 workspace once per Q tile.
-- A final kernel converts the workspace to public FP16 dQ.
+- A final kernel converts the workspace to public 16-bit dQ.
 
 ### Launch and Layout Policy
 
@@ -60,12 +60,12 @@ The HND-copy path is limited to contiguous B1 self-attention for the production 
 | --- | ---: | ---: | ---: |
 | Workgroup | 256 threads / 8 waves | 256 threads / 8 waves | 512 threads / 16 waves |
 | Owner rows | 64 KV rows | 64 KV rows | 256 query rows |
-| Ownership | Four score/dP wave pairs. Eight D16 slices for dK/dV/dQ | Four waves each for dK/dV | Persistent FP16 Q/dO, FP32 dQ |
+| Ownership | Four score/dP wave pairs. Eight D16 slices for dK/dV/dQ | Four waves each for dK/dV | Persistent 16-bit Q/dO, FP32 dQ |
 | Main LDS | 42,112 B | 26,752 B direct / 30,976 B cached-dO | 13,312 B |
 | Logical / allocated VGPR | 232 / 240 | 184 / 192 | 256 / 256 |
 | Effective residency | Six waves/SIMD, 36.6% occupancy | Six waves/SIMD | One workgroup/WGP, four waves/SIMD |
 
-The fused kernel keeps K/V row fragments in registers per wave pair, double-buffers Q/dO transpose views, exchanges score/dP through an 8 KiB FP32 SoA buffer, and publishes P/dS as half2 SoA fragments. The dSᵀ tile uses stride 20 and two 16 B loads. There is no K/V LDS tile. Aligned-Q/aligned-KV variants remove tail predicates for aligned shapes.
+The fused kernel keeps K/V row fragments in registers per wave pair, double-buffers Q/dO transpose views, exchanges score/dP through an 8 KiB FP32 SoA buffer, and publishes P/dS as 16-bit SoA fragments (`half2`/`bf16x2`). The dSᵀ tile uses stride 20 and two 16 B loads. There is no K/V LDS tile. Aligned-Q/aligned-KV variants remove tail predicates for aligned shapes.
 
 ### Linked Resources
 
@@ -75,6 +75,8 @@ The fused kernel keeps K/V row fragments in registers per wave pair, double-buff
 | D128 five-GEMM fused KV | 232 / 240 | 42,112 B | 0 / 0 / 0 |
 | D128 seven-GEMM fallback KV | 184 / 192 | 26,752 B | 0 / 0 / 0 |
 | D128 fallback Q | 256 / 256 | 13,312 B | 0 / 0 / 0 |
+
+Resource counts are for the FP16 instantiation. BF16 uses the same LDS layout.
 
 ## Benchmark and Correctness
 
@@ -87,6 +89,8 @@ F_actual = G * 2 * B * H * NQ * NKV * D
 ```
 
 In the current production matrix every row executes five GEMMs, so `TFLOPS_F5 == TFLOPS_actual`. The matrix uses five warmups and twelve repeats with the paired AITER control.
+
+Both dtype instantiations use the same kernel topology. A same-process A/B screen measured BF16/FP16 between `1.02x` and `1.05x` across D128 HND/NHD. No separate BF16 matrix is retained. Use `--dtype bf16` to select BF16 in the benchmark.
 
 ### Production Matrix
 
@@ -117,7 +121,7 @@ The HND geometric is `4.247419x`, NHD is `3.898182x`, and the combined matrix is
 
 ### Correctness Coverage
 
-The public backward screen is `46/46` and the forward regression contract is `188/188`. The D128 fused dispatch keeps dK, dV, and Delta bit-exact and requires tolerance equality for dQ. The previous rank-5 per-head screen is historical evidence for the old D128 image. No new rank-5 campaign has been run for the five-GEMM path. The H16/N4096 saved-state reference maximum absolute errors are approximately `dq 2.02e-4`, `dk 2.22e-4`, `dv 1.36e-4`, and `delta 5.96e-7`.
+The public backward screen is `93/93` across FP16 and BF16, and the forward regression contract is `188/188` (FP16 forward only). The D128 fused dispatch keeps dK, dV, and Delta bit-exact and requires tolerance equality for dQ for both dtypes. The previous rank-5 per-head screen is historical evidence for the old D128 image. No new rank-5 campaign has been run for the five-GEMM path. The FP16 H16/N4096 saved-state reference maximum absolute errors are approximately `dq 2.02e-4`, `dk 2.22e-4`, `dv 1.36e-4`, and `delta 5.96e-7`.
 
 ## Profile and Roofline
 
@@ -224,7 +228,7 @@ Remaining LDS conflicts are near the transaction minimum for 16 B dSᵀ/staging 
 - Reject spills/private memory or new scratch unless a large complete-path margin justifies review.
 - Full 18-row matrix after policy changes. Keep generic tails.
 
-- Promotion requires production-equivalent linked gfx1151 code, exact-symbol metadata/disassembly, zero private memory/spills/scratch, correct owner/tail/layout behavior, and a positive complete-path 18-row screen. The full D128 screen keeps the `46/46` backward and `188/188` forward contracts.
+- Promotion requires production-equivalent linked gfx1151 code, exact-symbol metadata/disassembly, zero private memory/spills/scratch, correct owner/tail/layout behavior, and a positive complete-path 18-row screen. The full D128 screen keeps the `93/93` backward and `188/188` forward contracts.
 - Timing uses alternating baseline/candidate blocks, raw samples, per-block ratios, log medians, and paired confidence intervals. Include Delta, Q, KV, allocation, conversion, and copies.
 - Accuracy tiers: directional cosine at least `0.997`. Preferred Rel-L2 at most `0.10`, exploratory below `0.20`. Exact scheduling/layout candidates preserve the elementwise contract.
 - Evidence hierarchy: runtime symbol from `rocprofv3`, linked metadata, exact-symbol disassembly, optimized MIR/pressure, then architecture/byte models. `llvm-readelf` is required for AMDGPU metadata. Virtual, allocated, and simultaneously live registers are distinct quantities.

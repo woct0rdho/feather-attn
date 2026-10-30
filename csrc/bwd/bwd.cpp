@@ -26,7 +26,7 @@
 
 namespace feather_attn {
 
-void AttnBwdFp16FeatherImpl(
+void AttnBwdFeatherImpl(
     const torch::stable::Tensor& dout,
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k,
@@ -62,15 +62,19 @@ void AttnBwdFp16FeatherImpl(
     CheckDevice(delta);
     if(dq_acc != nullptr)
         CheckDevice(*dq_acc);
-    STD_TORCH_CHECK(q.scalar_type() == torch::stable::ScalarType::Half &&
-                        k.scalar_type() == torch::stable::ScalarType::Half &&
-                        v.scalar_type() == torch::stable::ScalarType::Half &&
-                        out.scalar_type() == torch::stable::ScalarType::Half &&
-                        dout.scalar_type() == torch::stable::ScalarType::Half &&
-                        dq.scalar_type() == torch::stable::ScalarType::Half &&
-                        dk.scalar_type() == torch::stable::ScalarType::Half &&
-                        dv.scalar_type() == torch::stable::ScalarType::Half,
-                    "q, k, v, out, dout, dq, dk, and dv must be float16");
+    const auto attention_dtype = q.scalar_type();
+    STD_TORCH_CHECK(
+        attention_dtype == torch::stable::ScalarType::Half ||
+            attention_dtype == torch::stable::ScalarType::BFloat16,
+        "q must be float16 or bfloat16");
+    STD_TORCH_CHECK(k.scalar_type() == attention_dtype &&
+                        v.scalar_type() == attention_dtype &&
+                        out.scalar_type() == attention_dtype &&
+                        dout.scalar_type() == attention_dtype &&
+                        dq.scalar_type() == attention_dtype &&
+                        dk.scalar_type() == attention_dtype &&
+                        dv.scalar_type() == attention_dtype,
+                    "q, k, v, out, dout, dq, dk, and dv must have the same dtype");
     STD_TORCH_CHECK(
         softmax_lse.scalar_type() == torch::stable::ScalarType::Float &&
             delta.scalar_type() == torch::stable::ScalarType::Float,
@@ -214,6 +218,9 @@ void AttnBwdFp16FeatherImpl(
         static_cast<int32_t>(heads),
         static_cast<int32_t>(layout),
         static_cast<int32_t>(nhd_group_count),
+        attention_dtype == torch::stable::ScalarType::BFloat16
+            ? kBackwardDtypeBFloat16
+            : kBackwardDtypeFloat16,
         static_cast<float>(softmax_scale),
         reinterpret_cast<hipStream_t>(raw_stream)};
     (void)hipGetLastError();
@@ -228,7 +235,7 @@ void AttnBwdFp16FeatherImpl(
                     hipGetErrorString(launch_error));
 }
 
-void AttnBwdFp16Feather(
+void AttnBwdFeather(
     const torch::stable::Tensor& dout,
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k,
@@ -242,12 +249,12 @@ void AttnBwdFp16Feather(
     double softmax_scale,
     int64_t layout)
 {
-    AttnBwdFp16FeatherImpl(
+    AttnBwdFeatherImpl(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, delta,
         softmax_scale, layout, nullptr, false);
 }
 
-void AttnBwdFp16FeatherFused(
+void AttnBwdFeatherFused(
     const torch::stable::Tensor& dout,
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k,
@@ -262,33 +269,33 @@ void AttnBwdFp16FeatherFused(
     double softmax_scale,
     int64_t layout)
 {
-    AttnBwdFp16FeatherImpl(
+    AttnBwdFeatherImpl(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, delta,
         softmax_scale, layout, &dq_acc, true);
 }
 
 } // namespace feather_attn
 
-STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn_fp16, m)
+STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn, m)
 {
     m.def(
-        "attn_bwd_fp16_feather("
+        "attn_bwd_feather("
         "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, "
         "Tensor softmax_lse, Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, "
         "Tensor(d!) delta, float softmax_scale, int layout"
         ") -> ()");
     m.def(
-        "attn_bwd_fp16_feather_fused("
+        "attn_bwd_feather_fused("
         "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, "
         "Tensor softmax_lse, Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, "
         "Tensor(d!) delta, Tensor(e!) dq_acc, float softmax_scale, int layout"
         ") -> ()");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
+STABLE_TORCH_LIBRARY_IMPL(feather_attn, CUDA, m)
 {
-    m.impl("attn_bwd_fp16_feather", TORCH_BOX(&feather_attn::AttnBwdFp16Feather));
-    m.impl("attn_bwd_fp16_feather_fused", TORCH_BOX(&feather_attn::AttnBwdFp16FeatherFused));
+    m.impl("attn_bwd_feather", TORCH_BOX(&feather_attn::AttnBwdFeather));
+    m.impl("attn_bwd_feather_fused", TORCH_BOX(&feather_attn::AttnBwdFeatherFused));
 }
 
 #endif // NO_PYTORCH

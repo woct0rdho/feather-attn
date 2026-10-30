@@ -13,6 +13,7 @@ flash_attn_2 = flash_attn_amd.flash_attn_2
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU is required")
 
 LAYOUTS = ("HND", "NHD")
+DTYPES = ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))
 D64_SHAPES = (
     (1, 16, 33, 35),
     (1, 32, 65, 67),
@@ -32,14 +33,16 @@ HEAD_DIMS = (64, 128)
 def _backward_cases() -> tuple[object, ...]:
     return tuple(
         pytest.param(
+            dtype,
             layout,
             batch,
             heads,
             n_q,
             n_kv,
             head_dim,
-            id=f"{layout}-B{batch}-H{heads}-NQ{n_q}-NKV{n_kv}-D{head_dim}",
+            id=f"{dtype_name}-{layout}-B{batch}-H{heads}-NQ{n_q}-NKV{n_kv}-D{head_dim}",
         )
+        for dtype, dtype_name in DTYPES
         for layout, head_dim, (batch, heads, n_q, n_kv) in product(LAYOUTS, HEAD_DIMS, D64_SHAPES)
     )
 
@@ -83,13 +86,14 @@ def _saved_state(
     head_dim: int,
     seed: int,
     layout: str,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
-    q_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=torch.float16, generator=generator)
-    k_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=torch.float16, generator=generator)
-    v_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=torch.float16, generator=generator)
-    dout_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=torch.float16, generator=generator)
+    q_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=dtype, generator=generator)
+    k_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=dtype, generator=generator)
+    v_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=dtype, generator=generator)
+    dout_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=dtype, generator=generator)
     scale = head_dim**-0.5
     out_bshd, lse, _, _ = flash_attn_2.fwd(
         q_hnd.transpose(1, 2),
@@ -127,8 +131,12 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor, n_kv: int) -> No
     assert torch.all(difference.abs() <= tolerance), f"tol_ratio={tolerance_ratio:.3g}"
 
 
-@pytest.mark.parametrize(("layout", "batch", "heads", "n_q", "n_kv", "head_dim"), _backward_cases())
+@pytest.mark.parametrize(
+    ("dtype", "layout", "batch", "heads", "n_q", "n_kv", "head_dim"),
+    _backward_cases(),
+)
 def test_feather_attn_backward_matches_saved_state_reference(
+    dtype: torch.dtype,
     layout: str,
     batch: int,
     heads: int,
@@ -137,23 +145,26 @@ def test_feather_attn_backward_matches_saved_state_reference(
     head_dim: int,
 ) -> None:
     with torch.inference_mode():
-        state = _saved_state(batch, heads, n_q, n_kv, head_dim, seed=0, layout=layout)
+        state = _saved_state(batch, heads, n_q, n_kv, head_dim, seed=0, layout=layout, dtype=dtype)
         q, k, v, out, lse, dout, scale = state
         expected = _reference(q, k, v, out, lse, dout, scale, layout)
         actual = feather_attn_backward(dout, q, k, v, out, lse, softmax_scale=scale, layout=layout)
+        assert all(result.dtype == dtype for result in actual[:3])
+        assert actual[3].dtype == torch.float32
         for result, reference in zip(actual, expected):
             _assert_close(result, reference, n_kv)
 
 
+@pytest.mark.parametrize("dtype", [pytest.param(dtype, id=name) for dtype, name in DTYPES])
 @pytest.mark.parametrize("head_dim", HEAD_DIMS, ids=lambda head_dim: f"D{head_dim}")
-def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int) -> None:
+def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -> None:
     with torch.inference_mode():
-        q, k, v, out, lse, dout, scale = _saved_state(1, 32, 8192, 8192, head_dim, seed=0, layout="NHD")
+        q, k, v, out, lse, dout, scale = _saved_state(1, 32, 8192, 8192, head_dim, seed=0, layout="NHD", dtype=dtype)
         direct = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
         direct_delta = torch.empty_like(lse)
         if head_dim == 128:
             direct_dq_acc = torch.empty_like(q, dtype=torch.float32)
-            torch.ops.feather_attn_fp16.attn_bwd_fp16_feather_fused.default(
+            torch.ops.feather_attn.attn_bwd_feather_fused.default(
                 dout,
                 q,
                 k,
@@ -167,7 +178,7 @@ def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int) -> None:
                 1,
             )
         else:
-            torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
+            torch.ops.feather_attn.attn_bwd_feather.default(
                 dout,
                 q,
                 k,
@@ -188,3 +199,19 @@ def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int) -> None:
         else:
             for actual, expected in zip(selected, (*direct, direct_delta)):
                 assert torch.equal(actual, expected)
+
+
+def test_backward_rejects_mixed_attention_dtypes() -> None:
+    with torch.inference_mode():
+        q, k, v, out, lse, dout, scale = _saved_state(1, 8, 128, 128, 64, seed=0, layout="HND", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="same dtype"):
+            feather_attn_backward(
+                dout,
+                q,
+                k.to(torch.bfloat16),
+                v,
+                out,
+                lse,
+                softmax_scale=scale,
+                layout="HND",
+            )

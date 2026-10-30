@@ -14,7 +14,7 @@ def feather_attn(
     else:
         raise ValueError(f"layout must be 'HND' or 'NHD', got {layout}")
     out = torch.empty_like(q)
-    torch.ops.feather_attn_fp16.attn_fp16_feather.default(q, k, v, out, layout_id)
+    torch.ops.feather_attn.attn_fp16_feather.default(q, k, v, out, layout_id)
     return out
 
 
@@ -76,7 +76,7 @@ def _force_hnd_backward(
     dv_hnd = torch.empty_like(v_hnd)
     if fused:
         dq_acc_hnd = torch.empty_like(q_hnd, dtype=torch.float32)
-        torch.ops.feather_attn_fp16.attn_bwd_fp16_feather_fused.default(
+        torch.ops.feather_attn.attn_bwd_feather_fused.default(
             dout_hnd,
             q_hnd,
             k_hnd,
@@ -92,7 +92,7 @@ def _force_hnd_backward(
             0,
         )
     else:
-        torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
+        torch.ops.feather_attn.attn_bwd_feather.default(
             dout_hnd,
             q_hnd,
             k_hnd,
@@ -146,7 +146,7 @@ def feather_attn_backward(
         _force_hnd_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, fused=fused)
     elif fused and q.shape[-1] == 128:
         dq_acc = torch.empty_like(q, dtype=torch.float32)
-        torch.ops.feather_attn_fp16.attn_bwd_fp16_feather_fused.default(
+        torch.ops.feather_attn.attn_bwd_feather_fused.default(
             dout,
             q,
             k,
@@ -162,5 +162,5 @@ def feather_attn_backward(
             layout_id,
         )
     else:
-        torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, layout_id)
+        torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, layout_id)
     return dq, dk, dv, delta

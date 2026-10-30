@@ -10,6 +10,9 @@
 
 namespace feather_attn {
 
+constexpr int32_t kBackwardDtypeFloat16 = 0;
+constexpr int32_t kBackwardDtypeBFloat16 = 1;
+
 struct LaunchParams
 {
     const void* q_ptr;
@@ -60,6 +63,7 @@ struct BackwardLaunchParams
     int32_t num_heads;
     int32_t layout;
     int32_t nhd_group_count;
+    int32_t dtype;
     float softmax_scale;
     hipStream_t stream;
 };

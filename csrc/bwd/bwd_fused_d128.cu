@@ -1,9 +1,9 @@
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "launch_params.h"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace feather_attn {
 
@@ -21,12 +21,42 @@ constexpr int kQOwnerBlock = 256;
 constexpr int kKVOwnerBlock = 64;
 constexpr float kLog2E = 0x1.715476p+0f;
 
-using Half2 = _Float16 __attribute__((ext_vector_type(2)));
-using Half4 = _Float16 __attribute__((ext_vector_type(4)));
-using Half8 = _Float16 __attribute__((ext_vector_type(8)));
-using Half16 = _Float16 __attribute__((ext_vector_type(16)));
+template<typename Element, int N>
+using Vec = Element __attribute__((ext_vector_type(N)));
+
 using Float8 = float __attribute__((ext_vector_type(8)));
 using UInt8 = uint32_t __attribute__((ext_vector_type(8)));
+
+// gfx1151 lacks a native f32-to-bf16 convert/pack instruction. These helpers
+// apply round-to-nearest-even in integer arithmetic and use v_perm_b32 to pack
+// two bf16 values for a WMMA A fragment.
+template<typename Element>
+__device__ inline Element FromFloat(float value)
+{
+    if constexpr(std::is_same_v<Element, _Float16>)
+    {
+        return static_cast<Element>(value);
+    }
+    uint32_t bits = __builtin_bit_cast(uint32_t, value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return __builtin_bit_cast(
+        Element, static_cast<uint16_t>(bits >> 16));
+}
+
+template<typename Element>
+__device__ inline uint32_t PackPair(float x, float y)
+{
+    if constexpr(std::is_same_v<Element, _Float16>)
+    {
+        return __builtin_bit_cast(
+            uint32_t, __builtin_amdgcn_cvt_pkrtz(x, y));
+    }
+    uint32_t x_bits = __builtin_bit_cast(uint32_t, x);
+    uint32_t y_bits = __builtin_bit_cast(uint32_t, y);
+    x_bits += 0x7fffu + ((x_bits >> 16) & 1u);
+    y_bits += 0x7fffu + ((y_bits >> 16) & 1u);
+    return __builtin_amdgcn_perm(x_bits, y_bits, 0x03020706u);
+}
 
 __device__ inline int KVLdsOffset(int row, int chunk)
 {
@@ -34,17 +64,18 @@ __device__ inline int KVLdsOffset(int row, int chunk)
     return row * kHeadDim + physical_chunk * kPacked;
 }
 
-__device__ inline Half16 LoadKVRow16(
-    const _Float16* ptr,
+template<typename Element>
+__device__ inline Vec<Element, 16> LoadKVRow16(
+    const Element* ptr,
     int row,
     int d_tile)
 {
     const int chunk = d_tile * 2;
-    const Half8 lo = *reinterpret_cast<const Half8*>(
+    const Vec<Element, 8> lo = *reinterpret_cast<const Vec<Element, 8>*>(
         ptr + KVLdsOffset(row, chunk));
-    const Half8 hi = *reinterpret_cast<const Half8*>(
+    const Vec<Element, 8> hi = *reinterpret_cast<const Vec<Element, 8>*>(
         ptr + KVLdsOffset(row, chunk + 1));
-    Half16 result;
+    Vec<Element, 16> result;
 #pragma unroll
     for(int i = 0; i < 8; ++i)
     {
@@ -54,15 +85,16 @@ __device__ inline Half16 LoadKVRow16(
     return result;
 }
 
-__device__ inline Half16 LoadTransposeRow16(
-    const _Float16* ptr,
+template<typename Element>
+__device__ inline Vec<Element, 16> LoadTransposeRow16(
+    const Element* ptr,
     int row)
 {
-    Half16 result;
+    Vec<Element, 16> result;
 #pragma unroll
     for(int chunk = 0; chunk < kInnerBlock / 4; ++chunk)
     {
-        const Half4 value = *reinterpret_cast<const Half4*>(
+        const Vec<Element, 4> value = *reinterpret_cast<const Vec<Element, 4>*>(
             ptr + row * kTransposeStride + chunk * 4);
 #pragma unroll
         for(int i = 0; i < 4; ++i)
@@ -71,15 +103,26 @@ __device__ inline Half16 LoadTransposeRow16(
     return result;
 }
 
+template<typename Element>
 __device__ inline void WmmaInPlace(
     Float8& c,
-    const Half16& a,
-    const Half16& b)
+    const Vec<Element, 16>& a,
+    const Vec<Element, 16>& b)
 {
-    asm volatile(
-        "v_wmma_f32_16x16x16_f16 %0, %1, %2, %0"
-        : "+v"(c)
-        : "v"(a), "v"(b));
+    if constexpr(std::is_same_v<Element, __bf16>)
+    {
+        asm volatile(
+            "v_wmma_f32_16x16x16_bf16 %0, %1, %2, %0"
+            : "+v"(c)
+            : "v"(a), "v"(b));
+    }
+    else
+    {
+        asm volatile(
+            "v_wmma_f32_16x16x16_f16 %0, %1, %2, %0"
+            : "+v"(c)
+            : "v"(a), "v"(b));
+    }
 }
 
 __device__ inline void NativeAtomicAdd(float* address, float value)
@@ -92,7 +135,8 @@ __device__ inline void NativeAtomicAdd(float* address, float value)
 #endif
 }
 
-__device__ inline Half16 CFragmentToA(
+template<typename Element>
+__device__ inline Vec<Element, 16> CFragmentToA(
     const Float8& fragment,
     int lane)
 {
@@ -100,10 +144,8 @@ __device__ inline Half16 CFragmentToA(
 #pragma unroll
     for(int i = 0; i < 4; ++i)
     {
-        const uint32_t value = __builtin_bit_cast(
-            uint32_t,
-            __builtin_amdgcn_cvt_pkrtz(
-                fragment[i * 2], fragment[i * 2 + 1]));
+        const uint32_t value =
+            PackPair<Element>(fragment[i * 2], fragment[i * 2 + 1]);
         const uint32_t peer = __builtin_amdgcn_permlanex16(
             0u, value, 0x76543210u, 0xfedcba98u, false, true);
         const uint32_t selector_0 =
@@ -114,39 +156,43 @@ __device__ inline Half16 CFragmentToA(
         words[i * 2 + 1] = __builtin_amdgcn_perm(
             peer, value, selector_1);
     }
-    return __builtin_bit_cast(Half16, words);
+    return __builtin_bit_cast(Vec<Element, 16>, words);
 }
 
+template<typename Element>
 __device__ inline void StoreAFragmentSoA(
-    _Float16* base,
+    Element* base,
     int group,
     int lane,
-    const Half16& fragment)
+    const Vec<Element, 16>& fragment)
 {
-    _Float16* destination =
+    Element* destination =
         base + group * kInnerBlock * kWaveSize;
-    const Half2* source = reinterpret_cast<const Half2*>(&fragment);
+    const Vec<Element, 2>* source =
+        reinterpret_cast<const Vec<Element, 2>*>(&fragment);
 #pragma unroll
     for(int j = 0; j < kInnerBlock / 2; ++j)
     {
-        *reinterpret_cast<Half2*>(
+        *reinterpret_cast<Vec<Element, 2>*>(
             destination + (j * kWaveSize + lane) * 2) = source[j];
     }
 }
 
-__device__ inline Half16 LoadAFragmentSoA(
-    const _Float16* base,
+template<typename Element>
+__device__ inline Vec<Element, 16> LoadAFragmentSoA(
+    const Element* base,
     int group,
     int lane)
 {
-    const _Float16* source =
+    const Element* source =
         base + group * kInnerBlock * kWaveSize;
-    Half16 fragment;
-    Half2* destination = reinterpret_cast<Half2*>(&fragment);
+    Vec<Element, 16> fragment;
+    Vec<Element, 2>* destination =
+        reinterpret_cast<Vec<Element, 2>*>(&fragment);
 #pragma unroll
     for(int j = 0; j < kInnerBlock / 2; ++j)
     {
-        destination[j] = *reinterpret_cast<const Half2*>(
+        destination[j] = *reinterpret_cast<const Vec<Element, 2>*>(
             source + (j * kWaveSize + lane) * 2);
     }
     return fragment;
@@ -187,10 +233,10 @@ __device__ inline void DecodeOwner(
     }
 }
 
-template<bool kNhd>
+template<typename Element, bool kNhd>
 __global__ void DeltaD128Kernel(
-    const __half* __restrict__ out,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ out,
+    const Element* __restrict__ dout,
     float* __restrict__ delta,
     int rows,
     int n_q,
@@ -208,41 +254,44 @@ __global__ void DeltaD128Kernel(
         const int head = batch_row - q_row * num_heads;
         delta_row = (batch * num_heads + head) * n_q + q_row;
     }
-    const __half* out_row = out + linear * kHeadDim;
-    const __half* dout_row = dout + linear * kHeadDim;
+    const Element* out_row = out + linear * kHeadDim;
+    const Element* dout_row = dout + linear * kHeadDim;
     float value = 0.0f;
 #pragma unroll
     for(int d = 0; d < kHeadDim; ++d)
-        value += __half2float(out_row[d]) * __half2float(dout_row[d]);
+        value += static_cast<float>(out_row[d]) *
+                 static_cast<float>(dout_row[d]);
     delta[delta_row] = value;
 }
 
-template<bool kNhd, bool kComputeDq, bool kAlignedQ, bool kAlignedKV>
+template<typename Element, bool kNhd, bool kComputeDq, bool kAlignedQ, bool kAlignedKV>
 __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
-    const __half* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ q,
+    const Element* __restrict__ k,
+    const Element* __restrict__ v,
+    const Element* __restrict__ dout,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
     float* __restrict__ dq_acc,
-    __half* __restrict__ dk,
-    __half* __restrict__ dv,
+    Element* __restrict__ dk,
+    Element* __restrict__ dv,
     int n_q,
     int n_kv,
     int num_heads,
     int head_count,
     float scale)
 {
+    using Vec8 = Vec<Element, 8>;
+    using Vec16 = Vec<Element, 16>;
     constexpr int transpose_bytes =
-        kHeadDim * kTransposeStride * sizeof(_Float16);
-    constexpr int transpose_halves = kHeadDim * kTransposeStride;
+        kHeadDim * kTransposeStride * sizeof(Element);
+    constexpr int transpose_elements = kHeadDim * kTransposeStride;
     constexpr int transpose_buffers = kComputeDq ? 2 : 1;
     constexpr int exchange_floats = 32 * 8;
     constexpr int exchange_bytes =
         2 * (kKVOwnerBlock / kInnerBlock) * exchange_floats * sizeof(float);
     constexpr int fragment_bytes =
-        (kKVOwnerBlock / kInnerBlock) * 32 * kInnerBlock * sizeof(_Float16);
+        (kKVOwnerBlock / kInnerBlock) * 32 * kInnerBlock * sizeof(Element);
     constexpr int dst_bytes =
         kComputeDq ? (kKVOwnerBlock / kInnerBlock) * kInnerBlock * 20 * sizeof(float) : 0;
     constexpr int lse_bytes = 2 * kInnerBlock * sizeof(float);
@@ -256,13 +305,13 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
     static_assert(lds_bytes == (kComputeDq ? 42112 : 26752));
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
-    auto* q_transpose_lds = reinterpret_cast<_Float16*>(lds);
+    auto* q_transpose_lds = reinterpret_cast<Element*>(lds);
     auto* do_transpose_lds =
-        q_transpose_lds + transpose_buffers * transpose_halves;
+        q_transpose_lds + transpose_buffers * transpose_elements;
     uint8_t* const exchange_ptr =
         lds + 2 * transpose_buffers * transpose_bytes;
     auto* exchange = reinterpret_cast<float*>(exchange_ptr);
-    auto* p_a_lds = reinterpret_cast<_Float16*>(
+    auto* p_a_lds = reinterpret_cast<Element*>(
         exchange_ptr + exchange_bytes);
     auto* ds_a_lds = p_a_lds +
                      (kKVOwnerBlock / kInnerBlock) * 32 * kInnerBlock;
@@ -297,8 +346,8 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
     const float scale_log2 = scale * kLog2E;
     const bool kv_valid = kAlignedKV || kv_start + kv_row_local < n_kv;
 
-    const __half* const operand_base = is_producer ? k : v;
-    Half16 operand_rows[kHeadDim / kInnerBlock] = {};
+    const Element* const operand_base = is_producer ? k : v;
+    Vec16 operand_rows[kHeadDim / kInnerBlock] = {};
     if(kv_valid)
     {
 #pragma unroll
@@ -308,20 +357,20 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
                                (kv_start + kv_row_local) * kv_row_stride +
                                d_tile * kInnerBlock;
             operand_rows[d_tile] =
-                *reinterpret_cast<const Half16*>(operand_base + offset);
+                *reinterpret_cast<const Vec16*>(operand_base + offset);
         }
     }
 
     Float8 dk_accum[kKVOwnerBlock / kInnerBlock] = {};
     Float8 dv_accum[kKVOwnerBlock / kInnerBlock] = {};
-    Half16 k_b_fragments[kComputeDq ? (kKVOwnerBlock / kInnerBlock) : 1] = {};
+    Vec16 k_b_fragments[kComputeDq ? (kKVOwnerBlock / kInnerBlock) : 1] = {};
     if constexpr(kComputeDq)
     {
         const int d_column = wave * kInnerBlock + lane_row;
 #pragma unroll
         for(int r = 0; r < kKVOwnerBlock / kInnerBlock; ++r)
         {
-            Half16 fragment = {};
+            Vec16 fragment = {};
 #pragma unroll
             for(int j = 0; j < kInnerBlock; ++j)
             {
@@ -339,27 +388,27 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
             __syncthreads();
         const int q_phase =
             kComputeDq ? ((q_start / kInnerBlock) & 1) : 0;
-        _Float16* const q_transpose =
-            q_transpose_lds + q_phase * transpose_halves;
-        _Float16* const do_transpose =
-            do_transpose_lds + q_phase * transpose_halves;
+        Element* const q_transpose =
+            q_transpose_lds + q_phase * transpose_elements;
+        Element* const do_transpose =
+            do_transpose_lds + q_phase * transpose_elements;
 
         Float8 dq_accum = {};
         Float8 own_fragment = {};
         const bool lane_q_valid = kAlignedQ || q_start + lane_row < n_q;
         const int lane_q_row = q_start + (kAlignedQ || lane_q_valid ? lane_row : 0);
-        const __half* const q_row_ptr =
+        const Element* const q_row_ptr =
             q + q_offset + lane_q_row * q_row_stride;
-        const __half* const do_row_ptr =
+        const Element* const do_row_ptr =
             dout + q_offset + lane_q_row * q_row_stride;
         if(is_producer)
         {
 #pragma unroll
             for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
             {
-                Half16 q_row = {};
+                Vec16 q_row = {};
                 if(lane_q_valid)
-                    q_row = *reinterpret_cast<const Half16*>(
+                    q_row = *reinterpret_cast<const Vec16*>(
                         q_row_ptr + d_tile * kInnerBlock);
                 WmmaInPlace(own_fragment, q_row, operand_rows[d_tile]);
             }
@@ -369,9 +418,9 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
 #pragma unroll
             for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
             {
-                Half16 do_row = {};
+                Vec16 do_row = {};
                 if(lane_q_valid)
-                    do_row = *reinterpret_cast<const Half16*>(
+                    do_row = *reinterpret_cast<const Vec16*>(
                         do_row_ptr + d_tile * kInnerBlock);
                 WmmaInPlace(
                     own_fragment,
@@ -392,15 +441,15 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
             const int d_chunk = (wave % 4) * 4 + (lane % 4);
             const int stage_row = q_base + lane / 4;
             const int stage_chunk = d_chunk;
-            Half8 q_stage = {};
-            Half8 do_stage = {};
+            Vec8 q_stage = {};
+            Vec8 do_stage = {};
             if(kAlignedQ || q_start + stage_row < n_q)
             {
                 const int offset = q_offset +
                                    (q_start + stage_row) * q_row_stride +
                                    stage_chunk * kPacked;
-                q_stage = *reinterpret_cast<const Half8*>(q + offset);
-                do_stage = *reinterpret_cast<const Half8*>(dout + offset);
+                q_stage = *reinterpret_cast<const Vec8*>(q + offset);
+                do_stage = *reinterpret_cast<const Vec8*>(dout + offset);
             }
 #pragma unroll
             for(int i = 0; i < kPacked; ++i)
@@ -477,12 +526,12 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
 
         if(is_producer)
         {
-            const Half16 p_fragment = CFragmentToA(probability, lane);
+            const Vec16 p_fragment = CFragmentToA<Element>(probability, lane);
             StoreAFragmentSoA(p_a_lds, row_group, lane, p_fragment);
         }
         else
         {
-            const Half16 ds_fragment = CFragmentToA(d_score, lane);
+            const Vec16 ds_fragment = CFragmentToA<Element>(d_score, lane);
             StoreAFragmentSoA(ds_a_lds, row_group, lane, ds_fragment);
             if constexpr(kComputeDq)
             {
@@ -501,15 +550,15 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
         __syncthreads();
 
         const int d_row = wave * kInnerBlock + lane_row;
-        const Half16 q_b_fragment =
+        const Vec16 q_b_fragment =
             LoadTransposeRow16(q_transpose, d_row);
-        const Half16 do_b_fragment =
+        const Vec16 do_b_fragment =
             LoadTransposeRow16(do_transpose, d_row);
 #pragma unroll
         for(int r = 0; r < kKVOwnerBlock / kInnerBlock; ++r)
         {
-            const Half16 ds_fragment = LoadAFragmentSoA(ds_a_lds, r, lane);
-            const Half16 p_fragment = LoadAFragmentSoA(p_a_lds, r, lane);
+            const Vec16 ds_fragment = LoadAFragmentSoA<Element>(ds_a_lds, r, lane);
+            const Vec16 p_fragment = LoadAFragmentSoA<Element>(p_a_lds, r, lane);
             WmmaInPlace(dk_accum[r], ds_fragment, q_b_fragment);
             WmmaInPlace(dv_accum[r], p_fragment, do_b_fragment);
             if constexpr(kComputeDq)
@@ -529,7 +578,7 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
                 ds_t_fragment[5] = hi.y;
                 ds_t_fragment[6] = hi.z;
                 ds_t_fragment[7] = hi.w;
-                const Half16 ds_t_a = CFragmentToA(ds_t_fragment, lane);
+                const Vec16 ds_t_a = CFragmentToA<Element>(ds_t_fragment, lane);
                 WmmaInPlace(dq_accum, ds_t_a, k_b_fragments[r]);
             }
         }
@@ -564,41 +613,43 @@ __global__ __launch_bounds__(kKVThreads) void D128TwoPhaseKVKernel(
                 const int d = wave * kInnerBlock + lane_row;
                 const int offset = kv_offset +
                                    (kv_start + row) * kv_row_stride + d;
-                dk[offset] = __float2half(dk_accum[r][i] * scale);
-                dv[offset] = __float2half(dv_accum[r][i]);
+                dk[offset] = FromFloat<Element>(dk_accum[r][i] * scale);
+                dv[offset] = FromFloat<Element>(dv_accum[r][i]);
             }
         }
     }
 }
 
-template<bool kNhd>
+template<typename Element, bool kNhd>
 __global__ __launch_bounds__(kQThreads) void D128QKernel(
-    const __half* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ q,
+    const Element* __restrict__ k,
+    const Element* __restrict__ v,
+    const Element* __restrict__ dout,
     const float* __restrict__ lse,
     const float* __restrict__ delta,
-    __half* __restrict__ dq,
+    Element* __restrict__ dq,
     int n_q,
     int n_kv,
     int num_heads,
     int head_count,
     float scale)
 {
+    using Vec8 = Vec<Element, 8>;
+    using Vec16 = Vec<Element, 16>;
     constexpr int tile_bytes =
-        kInnerBlock * kHeadDim * sizeof(_Float16);
+        kInnerBlock * kHeadDim * sizeof(Element);
     constexpr int transpose_bytes =
-        kHeadDim * kTransposeStride * sizeof(_Float16);
+        kHeadDim * kTransposeStride * sizeof(Element);
     constexpr int lds_bytes = 2 * tile_bytes + transpose_bytes;
     static_assert(tile_bytes == 4096);
     static_assert(transpose_bytes == 5120);
     static_assert(lds_bytes == 13312);
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
-    auto* k_lds = reinterpret_cast<_Float16*>(lds);
-    auto* v_lds = reinterpret_cast<_Float16*>(lds + tile_bytes);
-    auto* k_transpose_lds = reinterpret_cast<_Float16*>(
+    auto* k_lds = reinterpret_cast<Element*>(lds);
+    auto* v_lds = reinterpret_cast<Element*>(lds + tile_bytes);
+    auto* k_transpose_lds = reinterpret_cast<Element*>(
         lds + 2 * tile_bytes);
 
     const int tid = threadIdx.x;
@@ -630,8 +681,8 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
     const float row_delta = q_valid
                                 ? delta[head_linear * n_q + q_start + lane_row]
                                 : 0.0f;
-    Half16 q_rows[kHeadDim / kInnerBlock] = {};
-    Half16 do_rows[kHeadDim / kInnerBlock] = {};
+    Vec16 q_rows[kHeadDim / kInnerBlock] = {};
+    Vec16 do_rows[kHeadDim / kInnerBlock] = {};
 #pragma unroll
     for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
     {
@@ -640,8 +691,8 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
             const int offset = q_offset +
                                (q_start + lane_row) * q_row_stride +
                                d_tile * kInnerBlock;
-            q_rows[d_tile] = *reinterpret_cast<const Half16*>(q + offset);
-            do_rows[d_tile] = *reinterpret_cast<const Half16*>(dout + offset);
+            q_rows[d_tile] = *reinterpret_cast<const Vec16*>(q + offset);
+            do_rows[d_tile] = *reinterpret_cast<const Vec16*>(dout + offset);
         }
     }
     Float8 dq_accum[kHeadDim / kInnerBlock] = {};
@@ -656,19 +707,19 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
                 linear_chunk / (kHeadDim / kPacked);
             const int stage_chunk =
                 linear_chunk % (kHeadDim / kPacked);
-            Half8 k_stage = {};
-            Half8 v_stage = {};
+            Vec8 k_stage = {};
+            Vec8 v_stage = {};
             if(kv_start + stage_row < n_kv)
             {
                 const int offset = kv_offset +
                                    (kv_start + stage_row) * kv_row_stride +
                                    stage_chunk * kPacked;
-                k_stage = *reinterpret_cast<const Half8*>(k + offset);
-                v_stage = *reinterpret_cast<const Half8*>(v + offset);
+                k_stage = *reinterpret_cast<const Vec8*>(k + offset);
+                v_stage = *reinterpret_cast<const Vec8*>(v + offset);
             }
-            *reinterpret_cast<Half8*>(
+            *reinterpret_cast<Vec8*>(
                 k_lds + KVLdsOffset(stage_row, stage_chunk)) = k_stage;
-            *reinterpret_cast<Half8*>(
+            *reinterpret_cast<Vec8*>(
                 v_lds + KVLdsOffset(stage_row, stage_chunk)) = v_stage;
 #pragma unroll
             for(int i = 0; i < kPacked; ++i)
@@ -712,7 +763,7 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
                                    (d_probability[i] - row_delta)
                              : 0.0f;
         }
-        const Half16 ds_fragment = CFragmentToA(d_score, lane);
+        const Vec16 ds_fragment = CFragmentToA<Element>(d_score, lane);
 #pragma unroll
         for(int d_pair = 0;
             d_pair < kHeadDim / (2 * kInnerBlock);
@@ -742,16 +793,16 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
             {
                 const int d = d_tile * kInnerBlock + lane_row;
                 dq[q_offset + (q_start + row) * q_row_stride + d] =
-                    __float2half(dq_accum[d_tile][i] * scale);
+                    FromFloat<Element>(dq_accum[d_tile][i] * scale);
             }
         }
     }
 }
 
-template<bool kNhd>
+template<typename Element, bool kNhd>
 __global__ void DeltaD128ClearKernel(
-    const __half* __restrict__ out,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ out,
+    const Element* __restrict__ dout,
     float* __restrict__ delta,
     float* __restrict__ dq_acc,
     int rows,
@@ -770,41 +821,43 @@ __global__ void DeltaD128ClearKernel(
         const int head = batch_row - q_row * num_heads;
         delta_row = (batch * num_heads + head) * n_q + q_row;
     }
-    const __half* out_row = out + linear * kHeadDim;
-    const __half* dout_row = dout + linear * kHeadDim;
+    const Element* out_row = out + linear * kHeadDim;
+    const Element* dout_row = dout + linear * kHeadDim;
     float* dq_row = dq_acc + linear * kHeadDim;
     float value = 0.0f;
 #pragma unroll
     for(int d = 0; d < kHeadDim; ++d)
     {
-        value += __half2float(out_row[d]) * __half2float(dout_row[d]);
+        value += static_cast<float>(out_row[d]) *
+                 static_cast<float>(dout_row[d]);
         dq_row[d] = 0.0f;
     }
     delta[delta_row] = value;
 }
 
+template<typename Element>
 __global__ void D128DqConvertKernel(
     const float* __restrict__ dq_acc,
-    __half* __restrict__ dq,
+    Element* __restrict__ dq,
     int elements)
 {
     const int linear = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if(linear < elements)
-        dq[linear] = __float2half(dq_acc[linear]);
+        dq[linear] = FromFloat<Element>(dq_acc[linear]);
 }
 
-template<bool kNhd>
+template<bool kNhd, typename Element>
 bool LaunchD128Backward(const BackwardLaunchParams& params)
 {
-    const auto* q = reinterpret_cast<const __half*>(params.q_ptr);
-    const auto* k = reinterpret_cast<const __half*>(params.k_ptr);
-    const auto* v = reinterpret_cast<const __half*>(params.v_ptr);
-    const auto* out = reinterpret_cast<const __half*>(params.out_ptr);
+    const auto* q = reinterpret_cast<const Element*>(params.q_ptr);
+    const auto* k = reinterpret_cast<const Element*>(params.k_ptr);
+    const auto* v = reinterpret_cast<const Element*>(params.v_ptr);
+    const auto* out = reinterpret_cast<const Element*>(params.out_ptr);
     const auto* lse = reinterpret_cast<const float*>(params.lse_ptr);
-    const auto* dout = reinterpret_cast<const __half*>(params.dout_ptr);
-    auto* dq = reinterpret_cast<__half*>(params.dq_ptr);
-    auto* dk = reinterpret_cast<__half*>(params.dk_ptr);
-    auto* dv = reinterpret_cast<__half*>(params.dv_ptr);
+    const auto* dout = reinterpret_cast<const Element*>(params.dout_ptr);
+    auto* dq = reinterpret_cast<Element*>(params.dq_ptr);
+    auto* dk = reinterpret_cast<Element*>(params.dk_ptr);
+    auto* dv = reinterpret_cast<Element*>(params.dv_ptr);
     auto* delta = reinterpret_cast<float*>(params.delta_ptr);
     const int32_t q_rows = params.head_count * params.n_q;
     const int32_t q_tiles =
@@ -817,7 +870,7 @@ bool LaunchD128Backward(const BackwardLaunchParams& params)
         (static_cast<uint32_t>(q_rows) + kRowsBlock - 1) /
         kRowsBlock);
     hipLaunchKernelGGL(
-        (DeltaD128Kernel<kNhd>),
+        (DeltaD128Kernel<Element, kNhd>),
         delta_grid,
         delta_block,
         0,
@@ -836,7 +889,7 @@ bool LaunchD128Backward(const BackwardLaunchParams& params)
     const bool aligned_kv = params.n_kv % kKVOwnerBlock == 0;
     auto launch_fallback = [&]<bool kAlignedQ, bool kAlignedKV>() {
         hipLaunchKernelGGL(
-            (D128TwoPhaseKVKernel<kNhd, false, kAlignedQ, kAlignedKV>),
+            (D128TwoPhaseKVKernel<Element, kNhd, false, kAlignedQ, kAlignedKV>),
             kv_grid,
             kv_block,
             0,
@@ -869,7 +922,7 @@ bool LaunchD128Backward(const BackwardLaunchParams& params)
         static_cast<uint32_t>(params.head_count * q_tiles));
     const dim3 q_block(kQThreads);
     hipLaunchKernelGGL(
-        (D128QKernel<kNhd>),
+        (D128QKernel<Element, kNhd>),
         q_grid,
         q_block,
         0,
@@ -889,18 +942,18 @@ bool LaunchD128Backward(const BackwardLaunchParams& params)
     return hipPeekAtLastError() == hipSuccess;
 }
 
-template<bool kNhd>
+template<bool kNhd, typename Element>
 bool LaunchD128FusedDq(const BackwardLaunchParams& params)
 {
-    const auto* q = reinterpret_cast<const __half*>(params.q_ptr);
-    const auto* k = reinterpret_cast<const __half*>(params.k_ptr);
-    const auto* v = reinterpret_cast<const __half*>(params.v_ptr);
-    const auto* out = reinterpret_cast<const __half*>(params.out_ptr);
+    const auto* q = reinterpret_cast<const Element*>(params.q_ptr);
+    const auto* k = reinterpret_cast<const Element*>(params.k_ptr);
+    const auto* v = reinterpret_cast<const Element*>(params.v_ptr);
+    const auto* out = reinterpret_cast<const Element*>(params.out_ptr);
     const auto* lse = reinterpret_cast<const float*>(params.lse_ptr);
-    const auto* dout = reinterpret_cast<const __half*>(params.dout_ptr);
-    auto* dq = reinterpret_cast<__half*>(params.dq_ptr);
-    auto* dk = reinterpret_cast<__half*>(params.dk_ptr);
-    auto* dv = reinterpret_cast<__half*>(params.dv_ptr);
+    const auto* dout = reinterpret_cast<const Element*>(params.dout_ptr);
+    auto* dq = reinterpret_cast<Element*>(params.dq_ptr);
+    auto* dk = reinterpret_cast<Element*>(params.dk_ptr);
+    auto* dv = reinterpret_cast<Element*>(params.dv_ptr);
     auto* delta = reinterpret_cast<float*>(params.delta_ptr);
     auto* dq_acc = reinterpret_cast<float*>(params.dq_acc_ptr);
     const int32_t q_rows = params.head_count * params.n_q;
@@ -912,7 +965,7 @@ bool LaunchD128FusedDq(const BackwardLaunchParams& params)
         (static_cast<uint32_t>(q_rows) + kRowsBlock - 1) /
         kRowsBlock);
     hipLaunchKernelGGL(
-        (DeltaD128ClearKernel<kNhd>),
+        (DeltaD128ClearKernel<Element, kNhd>),
         delta_grid,
         row_block,
         0,
@@ -931,7 +984,7 @@ bool LaunchD128FusedDq(const BackwardLaunchParams& params)
     const bool aligned_kv = params.n_kv % kKVOwnerBlock == 0;
     auto launch_fused = [&]<bool kAlignedQ, bool kAlignedKV>() {
         hipLaunchKernelGGL(
-            (D128TwoPhaseKVKernel<kNhd, true, kAlignedQ, kAlignedKV>),
+            (D128TwoPhaseKVKernel<Element, kNhd, true, kAlignedQ, kAlignedKV>),
             kv_grid,
             dim3(kKVThreads),
             0,
@@ -965,7 +1018,7 @@ bool LaunchD128FusedDq(const BackwardLaunchParams& params)
         (static_cast<uint32_t>(elements) + kRowsBlock - 1) /
         kRowsBlock);
     hipLaunchKernelGGL(
-        D128DqConvertKernel,
+        (D128DqConvertKernel<Element>),
         convert_grid,
         row_block,
         0,
@@ -976,20 +1029,38 @@ bool LaunchD128FusedDq(const BackwardLaunchParams& params)
     return hipPeekAtLastError() == hipSuccess;
 }
 
+template<typename Element>
+bool DispatchD128Backward(const BackwardLaunchParams& params)
+{
+    return params.layout == 1
+               ? LaunchD128Backward<true, Element>(params)
+               : LaunchD128Backward<false, Element>(params);
+}
+
+template<typename Element>
+bool DispatchD128FusedDq(const BackwardLaunchParams& params)
+{
+    return params.layout == 1
+               ? LaunchD128FusedDq<true, Element>(params)
+               : LaunchD128FusedDq<false, Element>(params);
+}
+
 } // namespace
 
 extern "C" bool feather_attn_bwd_d128_fused(
     const BackwardLaunchParams& params)
 {
-    return params.layout == 1 ? LaunchD128Backward<true>(params)
-                              : LaunchD128Backward<false>(params);
+    return params.dtype == kBackwardDtypeBFloat16
+               ? DispatchD128Backward<__bf16>(params)
+               : DispatchD128Backward<_Float16>(params);
 }
 
 extern "C" bool feather_attn_bwd_d128_fused_dq(
     const BackwardLaunchParams& params)
 {
-    return params.layout == 1 ? LaunchD128FusedDq<true>(params)
-                              : LaunchD128FusedDq<false>(params);
+    return params.dtype == kBackwardDtypeBFloat16
+               ? DispatchD128FusedDq<__bf16>(params)
+               : DispatchD128FusedDq<_Float16>(params);
 }
 
 } // namespace feather_attn

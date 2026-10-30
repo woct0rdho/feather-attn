@@ -237,7 +237,7 @@ void AttnFp16Feather(
 
 } // namespace feather_attn
 
-STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
+STABLE_TORCH_LIBRARY(feather_attn, m)
 {
     m.def(
         "attn_fp16_feather("
@@ -249,7 +249,7 @@ STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
         ") -> ()");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
+STABLE_TORCH_LIBRARY_IMPL(feather_attn, CUDA, m)
 {
     m.impl("attn_fp16_feather", TORCH_BOX(&feather_attn::AttnFp16Feather));
 }

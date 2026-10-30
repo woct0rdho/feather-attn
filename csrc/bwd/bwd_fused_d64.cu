@@ -1,9 +1,9 @@
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "launch_params.h"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace feather_attn {
 
@@ -23,12 +23,44 @@ constexpr int kPacked = 8;
 constexpr int kTransposeStride = 20;
 constexpr float kLog2E = 0x1.715476p+0f;
 
-using Half2 = _Float16 __attribute__((ext_vector_type(2)));
-using Half4 = _Float16 __attribute__((ext_vector_type(4)));
-using Half8 = _Float16 __attribute__((ext_vector_type(8)));
-using Half16 = _Float16 __attribute__((ext_vector_type(16)));
+template<typename Element, int N>
+using Vec = Element __attribute__((ext_vector_type(N)));
+
 using Float8 = float __attribute__((ext_vector_type(8)));
 using UInt8 = uint32_t __attribute__((ext_vector_type(8)));
+
+// gfx1151 lacks a native f32-to-bf16 convert/pack instruction. These helpers
+// apply round-to-nearest-even in integer arithmetic and use v_perm_b32 to pack
+// two bf16 values for a WMMA A fragment.
+template<typename Element>
+__device__ inline Element FromFloat(float value)
+{
+    if constexpr(std::is_same_v<Element, _Float16>)
+    {
+        return static_cast<Element>(value);
+    }
+    uint32_t bits = __builtin_bit_cast(uint32_t, value);
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return __builtin_bit_cast(
+        Element, static_cast<uint16_t>(bits >> 16));
+}
+
+template<typename Element>
+__device__ inline uint32_t PackPair(float x, float y)
+{
+    if constexpr(std::is_same_v<Element, _Float16>)
+    {
+        Vec<Element, 2> pair;
+        pair[0] = static_cast<Element>(x);
+        pair[1] = static_cast<Element>(y);
+        return __builtin_bit_cast(uint32_t, pair);
+    }
+    uint32_t x_bits = __builtin_bit_cast(uint32_t, x);
+    uint32_t y_bits = __builtin_bit_cast(uint32_t, y);
+    x_bits += 0x7fffu + ((x_bits >> 16) & 1u);
+    y_bits += 0x7fffu + ((y_bits >> 16) & 1u);
+    return __builtin_amdgcn_perm(x_bits, y_bits, 0x03020706u);
+}
 
 __device__ inline int KVLdsOffset(int row, int chunk)
 {
@@ -36,17 +68,18 @@ __device__ inline int KVLdsOffset(int row, int chunk)
     return row * kHeadDim + physical_chunk * kPacked;
 }
 
-__device__ inline Half16 LoadKVRow16(
-    const _Float16* ptr,
+template<typename Element>
+__device__ inline Vec<Element, 16> LoadKVRow16(
+    const Element* ptr,
     int row,
     int d_tile)
 {
     const int chunk = d_tile * 2;
-    const Half8 lo = *reinterpret_cast<const Half8*>(
+    const Vec<Element, 8> lo = *reinterpret_cast<const Vec<Element, 8>*>(
         ptr + KVLdsOffset(row, chunk));
-    const Half8 hi = *reinterpret_cast<const Half8*>(
+    const Vec<Element, 8> hi = *reinterpret_cast<const Vec<Element, 8>*>(
         ptr + KVLdsOffset(row, chunk + 1));
-    Half16 result;
+    Vec<Element, 16> result;
 #pragma unroll
     for(int i = 0; i < 8; ++i)
     {
@@ -56,15 +89,16 @@ __device__ inline Half16 LoadKVRow16(
     return result;
 }
 
-__device__ inline Half16 LoadTransposeRow16(
-    const _Float16* ptr,
+template<typename Element>
+__device__ inline Vec<Element, 16> LoadTransposeRow16(
+    const Element* ptr,
     int row)
 {
-    Half16 result;
+    Vec<Element, 16> result;
 #pragma unroll
     for(int chunk = 0; chunk < kInnerBlock / 4; ++chunk)
     {
-        const Half4 value = *reinterpret_cast<const Half4*>(
+        const Vec<Element, 4> value = *reinterpret_cast<const Vec<Element, 4>*>(
             ptr + row * kTransposeStride + chunk * 4);
 #pragma unroll
         for(int i = 0; i < 4; ++i)
@@ -73,18 +107,30 @@ __device__ inline Half16 LoadTransposeRow16(
     return result;
 }
 
+template<typename Element>
 __device__ inline void WmmaInPlace(
     Float8& c,
-    const Half16& a,
-    const Half16& b)
+    const Vec<Element, 16>& a,
+    const Vec<Element, 16>& b)
 {
-    asm volatile(
-        "v_wmma_f32_16x16x16_f16 %0, %1, %2, %0"
-        : "+v"(c)
-        : "v"(a), "v"(b));
+    if constexpr(std::is_same_v<Element, __bf16>)
+    {
+        asm volatile(
+            "v_wmma_f32_16x16x16_bf16 %0, %1, %2, %0"
+            : "+v"(c)
+            : "v"(a), "v"(b));
+    }
+    else
+    {
+        asm volatile(
+            "v_wmma_f32_16x16x16_f16 %0, %1, %2, %0"
+            : "+v"(c)
+            : "v"(a), "v"(b));
+    }
 }
 
-__device__ inline Half16 CFragmentToA(
+template<typename Element>
+__device__ inline Vec<Element, 16> CFragmentToA(
     const Float8& fragment,
     int lane)
 {
@@ -92,10 +138,8 @@ __device__ inline Half16 CFragmentToA(
 #pragma unroll
     for(int i = 0; i < 4; ++i)
     {
-        Half2 pair;
-        pair[0] = static_cast<_Float16>(fragment[i * 2]);
-        pair[1] = static_cast<_Float16>(fragment[i * 2 + 1]);
-        const uint32_t value = __builtin_bit_cast(uint32_t, pair);
+        const uint32_t value =
+            PackPair<Element>(fragment[i * 2], fragment[i * 2 + 1]);
         const uint32_t peer = __builtin_amdgcn_permlanex16(
             0u, value, 0x76543210u, 0xfedcba98u, false, true);
         const uint32_t selector_0 =
@@ -107,7 +151,7 @@ __device__ inline Half16 CFragmentToA(
         words[i * 2 + 1] = __builtin_amdgcn_perm(
             peer, value, selector_1);
     }
-    return __builtin_bit_cast(Half16, words);
+    return __builtin_bit_cast(Vec<Element, 16>, words);
 }
 
 template<bool kNhd>
@@ -125,10 +169,10 @@ __device__ inline int HeadOffset(
     return head_linear * rows * kHeadDim;
 }
 
-template<bool kNhd>
+template<typename Element, bool kNhd>
 __global__ void DeltaKernel(
-    const __half* __restrict__ out,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ out,
+    const Element* __restrict__ dout,
     float* __restrict__ delta,
     int rows,
     int n_q,
@@ -147,31 +191,32 @@ __global__ void DeltaKernel(
         delta_row = (batch * num_heads + head) * n_q + q_row;
     }
     const int offset = linear * kHeadDim;
-    const __half* out_row = out + offset;
-    const __half* dout_row = dout + offset;
+    const Element* out_row = out + offset;
+    const Element* dout_row = dout + offset;
     float value = 0.0f;
 #pragma unroll
     for(int d = 0; d < kHeadDim; ++d)
-        value += __half2float(out_row[d]) * __half2float(dout_row[d]);
+        value += static_cast<float>(out_row[d]) *
+                 static_cast<float>(dout_row[d]);
     delta[delta_row] = value;
 }
 
-template<int kPhase, bool kNhd, bool kAlignedQ, bool kAlignedKV>
+template<typename Element, int kPhase, bool kNhd, bool kAlignedQ, bool kAlignedKV>
 __global__ __launch_bounds__(
     kPhase == 1 && !kNhd
         ? kKVThreads
         : (kPhase == 2 ? kQThreads : kThreads)) void
 SevenGemmD64Kernel(
-    const __half* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
-    const __half* __restrict__ out,
-    const __half* __restrict__ dout,
+    const Element* __restrict__ q,
+    const Element* __restrict__ k,
+    const Element* __restrict__ v,
+    const Element* __restrict__ out,
+    const Element* __restrict__ dout,
     const float* __restrict__ lse,
     float* __restrict__ delta,
-    __half* __restrict__ dq,
-    __half* __restrict__ dk,
-    __half* __restrict__ dv,
+    Element* __restrict__ dq,
+    Element* __restrict__ dk,
+    Element* __restrict__ dv,
     int n_q,
     int n_kv,
     int num_heads,
@@ -179,6 +224,8 @@ SevenGemmD64Kernel(
     int nhd_group_count,
     float scale)
 {
+    using Vec8 = Vec<Element, 8>;
+    using Vec16 = Vec<Element, 16>;
     constexpr bool wide_kv = kPhase == 1 && !kNhd;
     constexpr int phase_threads =
         wide_kv ? kKVThreads : (kPhase == 2 ? kQThreads : kThreads);
@@ -187,14 +234,14 @@ SevenGemmD64Kernel(
     constexpr int q_owner_block =
         kPhase == 2 ? kQOwnerBlock : kOwnerBlock;
     constexpr int kv_bytes =
-        kv_owner_block * kHeadDim * sizeof(_Float16);
+        kv_owner_block * kHeadDim * sizeof(Element);
     constexpr int transpose_bytes =
-        2 * kTransposeStride * kHeadDim * sizeof(_Float16);
+        2 * kTransposeStride * kHeadDim * sizeof(Element);
     constexpr int q_kv_tile_bytes =
-        2 * kInnerBlock * kHeadDim * sizeof(_Float16);
+        2 * kInnerBlock * kHeadDim * sizeof(Element);
     constexpr int do_row_stride = 72;
     constexpr int do_row_bytes =
-        kInnerBlock * do_row_stride * sizeof(_Float16);
+        kInnerBlock * do_row_stride * sizeof(Element);
     constexpr int stage_buffers = wide_kv ? 2 : 1;
     constexpr int q_stage_buffers = kPhase == 2 ? 2 : 1;
     constexpr int transpose_buffers =
@@ -214,16 +261,16 @@ SevenGemmD64Kernel(
                      : (kPhase == 1 ? (wide_kv ? 31232 : 15616) : 13312)));
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
-    auto* kv_v_lds = reinterpret_cast<_Float16*>(lds);
-    auto* q_k_lds = reinterpret_cast<_Float16*>(lds);
-    auto* q_v_lds = reinterpret_cast<_Float16*>(
+    auto* kv_v_lds = reinterpret_cast<Element*>(lds);
+    auto* q_k_lds = reinterpret_cast<Element*>(lds);
+    auto* q_v_lds = reinterpret_cast<Element*>(
         lds + (kPhase == 2 ? 2 * q_kv_tile_bytes : q_kv_tile_bytes));
     auto* transpose_lds = lds + q_kv_storage;
-    auto* k_transpose_lds = reinterpret_cast<_Float16*>(transpose_lds);
-    auto* q_transpose_lds = reinterpret_cast<_Float16*>(transpose_lds);
+    auto* k_transpose_lds = reinterpret_cast<Element*>(transpose_lds);
+    auto* q_transpose_lds = reinterpret_cast<Element*>(transpose_lds);
     auto* do_transpose_lds = q_transpose_lds + kTransposeStride * kHeadDim;
     auto* do_row_lds =
-        reinterpret_cast<_Float16*>(transpose_lds + transpose_buffers * transpose_bytes);
+        reinterpret_cast<Element*>(transpose_lds + transpose_buffers * transpose_bytes);
     static_assert(
         transpose_buffers * transpose_bytes +
             (kPhase == 1 ? stage_buffers * do_row_bytes : 0) <=
@@ -303,22 +350,22 @@ SevenGemmD64Kernel(
             const int linear_chunk = tid + issue * phase_threads;
             const int row = linear_chunk / (kHeadDim / kPacked);
             const int chunk = linear_chunk % (kHeadDim / kPacked);
-            Half8 v_value = {};
+            Vec8 v_value = {};
             if(kAlignedKV || kv_start + row < n_kv)
             {
                 const int global_offset =
                     kv_offset + (kv_start + row) * kv_row_stride +
                     chunk * kPacked;
-                v_value = *reinterpret_cast<const Half8*>(v + global_offset);
+                v_value = *reinterpret_cast<const Vec8*>(v + global_offset);
             }
-            *reinterpret_cast<Half8*>(kv_v_lds + KVLdsOffset(row, chunk)) =
+            *reinterpret_cast<Vec8*>(kv_v_lds + KVLdsOffset(row, chunk)) =
                 v_value;
         }
         __syncthreads();
 
         Float8 dk_accum[4] = {};
         Float8 dv_accum[4] = {};
-        Half16 k_rows[kHeadDim / kInnerBlock];
+        Vec16 k_rows[kHeadDim / kInnerBlock];
 #pragma unroll
         for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
         {
@@ -329,7 +376,7 @@ SevenGemmD64Kernel(
                 const int global_offset =
                     kv_offset + (kv_start + kv_row) * kv_row_stride +
                     d_tile * kInnerBlock;
-                k_rows[d_tile] = *reinterpret_cast<const Half16*>(
+                k_rows[d_tile] = *reinterpret_cast<const Vec16*>(
                     k + global_offset);
             }
         }
@@ -340,27 +387,27 @@ SevenGemmD64Kernel(
                 __syncthreads();
             const int stage_phase =
                 wide_kv ? ((q_start / kInnerBlock) & 1) : 0;
-            _Float16* const q_stage_lds =
+            Element* const q_stage_lds =
                 q_transpose_lds +
                 stage_phase * 2 * kTransposeStride * kHeadDim;
-            _Float16* const do_stage_lds =
+            Element* const do_stage_lds =
                 do_transpose_lds +
                 stage_phase * 2 * kTransposeStride * kHeadDim;
-            _Float16* const do_row_stage_lds =
+            Element* const do_row_stage_lds =
                 do_row_lds + stage_phase * do_row_stride * kInnerBlock;
             if(tid < kInnerBlock * kHeadDim / kPacked)
             {
                 const int stage_row = tid / (kHeadDim / kPacked);
                 const int stage_chunk = tid % (kHeadDim / kPacked);
-                Half8 q_stage = {};
-                Half8 do_stage = {};
+                Vec8 q_stage = {};
+                Vec8 do_stage = {};
                 if(kAlignedQ || q_start + stage_row < n_q)
                 {
                     const int global_offset =
                         q_offset + (q_start + stage_row) * q_row_stride +
                         stage_chunk * kPacked;
-                    q_stage = *reinterpret_cast<const Half8*>(q + global_offset);
-                    do_stage = *reinterpret_cast<const Half8*>(
+                    q_stage = *reinterpret_cast<const Vec8*>(q + global_offset);
+                    do_stage = *reinterpret_cast<const Vec8*>(
                         dout + global_offset);
                 }
 #pragma unroll
@@ -374,7 +421,7 @@ SevenGemmD64Kernel(
                 }
                 if constexpr(kPhase == 1)
                 {
-                    *reinterpret_cast<Half8*>(
+                    *reinterpret_cast<Vec8*>(
                         do_row_stage_lds + stage_row * do_row_stride +
                         stage_chunk * kPacked) = do_stage;
                 }
@@ -385,13 +432,13 @@ SevenGemmD64Kernel(
 #pragma unroll
             for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
             {
-                Half16 q_row = {};
+                Vec16 q_row = {};
                 if(kAlignedQ || q_start + lane_row < n_q)
                 {
                     const int offset =
                         q_offset + (q_start + lane_row) * q_row_stride +
                         d_tile * 16;
-                    q_row = *reinterpret_cast<const Half16*>(q + offset);
+                    q_row = *reinterpret_cast<const Vec16*>(q + offset);
                 }
                 WmmaInPlace(score, q_row, k_rows[d_tile]);
             }
@@ -423,7 +470,7 @@ SevenGemmD64Kernel(
                               score[i] * scale_log2 - column_lse_log2)
                         : 0.0f;
             }
-            const Half16 p_fragment = CFragmentToA(probability, lane);
+            const Vec16 p_fragment = CFragmentToA<Element>(probability, lane);
 
 #pragma unroll
             for(int d_pair = 0;
@@ -432,9 +479,9 @@ SevenGemmD64Kernel(
             {
                 const int d0 = d_pair * 2 * kInnerBlock + lane_row;
                 const int d1 = d0 + kInnerBlock;
-                const Half16 do_column0 =
+                const Vec16 do_column0 =
                     LoadTransposeRow16(do_stage_lds, d0);
-                const Half16 do_column1 =
+                const Vec16 do_column1 =
                     LoadTransposeRow16(do_stage_lds, d1);
                 WmmaInPlace(dv_accum[d_pair * 2], p_fragment, do_column0);
                 WmmaInPlace(dv_accum[d_pair * 2 + 1], p_fragment, do_column1);
@@ -444,10 +491,10 @@ SevenGemmD64Kernel(
 #pragma unroll
             for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
             {
-                Half16 do_row = {};
+                Vec16 do_row = {};
                 if constexpr(kPhase == 1)
                 {
-                    do_row = *reinterpret_cast<const Half16*>(
+                    do_row = *reinterpret_cast<const Vec16*>(
                         do_row_stage_lds + lane_row * do_row_stride +
                         d_tile * kInnerBlock);
                 }
@@ -456,7 +503,7 @@ SevenGemmD64Kernel(
                     const int offset =
                         q_offset + (q_start + lane_row) * q_row_stride +
                         d_tile * 16;
-                    do_row = *reinterpret_cast<const Half16*>(dout + offset);
+                    do_row = *reinterpret_cast<const Vec16*>(dout + offset);
                 }
                 WmmaInPlace(
                     d_probability,
@@ -485,7 +532,7 @@ SevenGemmD64Kernel(
                 d_score[i] =
                     valid ? p * (d_probability[i] - column_delta) : 0.0f;
             }
-            const Half16 ds_fragment = CFragmentToA(d_score, lane);
+            const Vec16 ds_fragment = CFragmentToA<Element>(d_score, lane);
 
 #pragma unroll
             for(int d_pair = 0;
@@ -494,9 +541,9 @@ SevenGemmD64Kernel(
             {
                 const int d0 = d_pair * 2 * kInnerBlock + lane_row;
                 const int d1 = d0 + kInnerBlock;
-                const Half16 q_column0 =
+                const Vec16 q_column0 =
                     LoadTransposeRow16(q_stage_lds, d0);
-                const Half16 q_column1 =
+                const Vec16 q_column1 =
                     LoadTransposeRow16(q_stage_lds, d1);
                 WmmaInPlace(dk_accum[d_pair * 2], ds_fragment, q_column0);
                 WmmaInPlace(dk_accum[d_pair * 2 + 1], ds_fragment, q_column1);
@@ -516,8 +563,8 @@ SevenGemmD64Kernel(
                     const int d = d_tile * kInnerBlock + lane_row;
                     const int offset =
                         kv_offset + (kv_start + row) * kv_row_stride + d;
-                    dk[offset] = __float2half(dk_accum[d_tile][i] * scale);
-                    dv[offset] = __float2half(dv_accum[d_tile][i]);
+                    dk[offset] = FromFloat<Element>(dk_accum[d_tile][i] * scale);
+                    dv[offset] = FromFloat<Element>(dv_accum[d_tile][i]);
                 }
             }
         }
@@ -529,7 +576,7 @@ SevenGemmD64Kernel(
         const int q_start = q_block_start + wave * kInnerBlock;
         const float scale_log2 = scale * kLog2E;
         Float8 dq_accum[4] = {};
-        Half16 q_rows[kHeadDim / kInnerBlock] = {};
+        Vec16 q_rows[kHeadDim / kInnerBlock] = {};
 #pragma unroll
         for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
         {
@@ -538,10 +585,10 @@ SevenGemmD64Kernel(
                 const int offset =
                     q_offset + (q_start + lane_row) * q_row_stride +
                     d_tile * kInnerBlock;
-                q_rows[d_tile] = *reinterpret_cast<const Half16*>(q + offset);
+                q_rows[d_tile] = *reinterpret_cast<const Vec16*>(q + offset);
             }
         }
-        Half16 do_rows[kHeadDim / kInnerBlock] = {};
+        Vec16 do_rows[kHeadDim / kInnerBlock] = {};
 #pragma unroll
         for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
         {
@@ -550,7 +597,7 @@ SevenGemmD64Kernel(
                 const int offset =
                     q_offset + (q_start + lane_row) * q_row_stride +
                     d_tile * kInnerBlock;
-                do_rows[d_tile] = *reinterpret_cast<const Half16*>(
+                do_rows[d_tile] = *reinterpret_cast<const Vec16*>(
                     dout + offset);
             }
         }
@@ -573,13 +620,13 @@ SevenGemmD64Kernel(
                     const int offset =
                         q_offset + (q_start + lane_row) * q_row_stride +
                         d_tile * kInnerBlock;
-                    const Half16 out_row =
-                        *reinterpret_cast<const Half16*>(out + offset);
+                    const Vec16 out_row =
+                        *reinterpret_cast<const Vec16*>(out + offset);
 #pragma unroll
                     for(int i = 0; i < kInnerBlock; ++i)
                     {
-                        delta_value += __half2float(out_row[i]) *
-                                       __half2float(do_rows[d_tile][i]);
+                        delta_value += static_cast<float>(out_row[i]) *
+                                       static_cast<float>(do_rows[d_tile][i]);
                     }
                 }
                 delta[head_linear * n_q + q_start + lane_row] =
@@ -602,11 +649,11 @@ SevenGemmD64Kernel(
             const int q_phase = kPhase == 2
                                     ? ((kv_start / (2 * kInnerBlock)) & 1)
                                     : 0;
-            _Float16* const q_k_stage_lds =
+            Element* const q_k_stage_lds =
                 q_k_lds + q_phase * (q_kv_tile_bytes / 2);
-            _Float16* const q_v_stage_lds =
+            Element* const q_v_stage_lds =
                 q_v_lds + q_phase * (q_kv_tile_bytes / 2);
-            _Float16* const k_transpose_stage_lds =
+            Element* const k_transpose_stage_lds =
                 k_transpose_lds + q_phase * 2 * kHeadDim * kTransposeStride;
 #pragma unroll
             for(int issue = 0;
@@ -616,19 +663,19 @@ SevenGemmD64Kernel(
                 const int linear_chunk = tid + issue * phase_threads;
                 const int stage_row = linear_chunk / (kHeadDim / kPacked);
                 const int stage_chunk = linear_chunk % (kHeadDim / kPacked);
-                Half8 k_stage = {};
-                Half8 v_stage = {};
+                Vec8 k_stage = {};
+                Vec8 v_stage = {};
                 if(kAlignedKV || kv_start + stage_row < n_kv)
                 {
                     const int global_offset =
                         kv_offset + (kv_start + stage_row) * kv_row_stride +
                         stage_chunk * kPacked;
-                    k_stage = *reinterpret_cast<const Half8*>(k + global_offset);
-                    v_stage = *reinterpret_cast<const Half8*>(v + global_offset);
+                    k_stage = *reinterpret_cast<const Vec8*>(k + global_offset);
+                    v_stage = *reinterpret_cast<const Vec8*>(v + global_offset);
                 }
-                *reinterpret_cast<Half8*>(
+                *reinterpret_cast<Vec8*>(
                     q_k_stage_lds + KVLdsOffset(stage_row, stage_chunk)) = k_stage;
-                *reinterpret_cast<Half8*>(
+                *reinterpret_cast<Vec8*>(
                     q_v_stage_lds + KVLdsOffset(stage_row, stage_chunk)) = v_stage;
 #pragma unroll
                 for(int i = 0; i < kPacked; ++i)
@@ -654,7 +701,7 @@ SevenGemmD64Kernel(
                     d_tile < kHeadDim / kInnerBlock;
                     ++d_tile)
                 {
-                    const Half16 k_row =
+                    const Vec16 k_row =
                         LoadKVRow16(q_k_stage_lds, lds_row, d_tile);
                     WmmaInPlace(score, k_row, q_rows[d_tile]);
                 }
@@ -678,7 +725,7 @@ SevenGemmD64Kernel(
                     d_tile < kHeadDim / kInnerBlock;
                     ++d_tile)
                 {
-                    const Half16 v_row =
+                    const Vec16 v_row =
                         LoadKVRow16(q_v_stage_lds, lds_row, d_tile);
                     WmmaInPlace(d_probability, v_row, do_rows[d_tile]);
                 }
@@ -695,7 +742,7 @@ SevenGemmD64Kernel(
                                      ? p * (d_probability[i] - row_delta)
                                      : 0.0f;
                 }
-                const Half16 ds_fragment = CFragmentToA(d_score, lane);
+                const Vec16 ds_fragment = CFragmentToA<Element>(d_score, lane);
 
 #pragma unroll
                 for(int d_tile = 0;
@@ -703,7 +750,7 @@ SevenGemmD64Kernel(
                     ++d_tile)
                 {
                     const int d = d_tile * kInnerBlock + lane_row;
-                    const Half16 k_column = LoadTransposeRow16(
+                    const Vec16 k_column = LoadTransposeRow16(
                         k_transpose_stage_lds +
                             tile * kHeadDim * kTransposeStride,
                         d);
@@ -723,25 +770,25 @@ SevenGemmD64Kernel(
                 {
                     const int d = d_tile * kInnerBlock + lane_row;
                     dq[q_offset + (q_start + row) * q_row_stride + d] =
-                        __float2half(dq_accum[d_tile][i] * scale);
+                        FromFloat<Element>(dq_accum[d_tile][i] * scale);
                 }
             }
         }
     }
 }
 
-template<bool kNhd>
+template<bool kNhd, typename Element>
 bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
 {
-    const auto* q = reinterpret_cast<const __half*>(params.q_ptr);
-    const auto* k = reinterpret_cast<const __half*>(params.k_ptr);
-    const auto* v = reinterpret_cast<const __half*>(params.v_ptr);
-    const auto* out = reinterpret_cast<const __half*>(params.out_ptr);
+    const auto* q = reinterpret_cast<const Element*>(params.q_ptr);
+    const auto* k = reinterpret_cast<const Element*>(params.k_ptr);
+    const auto* v = reinterpret_cast<const Element*>(params.v_ptr);
+    const auto* out = reinterpret_cast<const Element*>(params.out_ptr);
     const auto* lse = reinterpret_cast<const float*>(params.lse_ptr);
-    const auto* dout = reinterpret_cast<const __half*>(params.dout_ptr);
-    auto* dq = reinterpret_cast<__half*>(params.dq_ptr);
-    auto* dk = reinterpret_cast<__half*>(params.dk_ptr);
-    auto* dv = reinterpret_cast<__half*>(params.dv_ptr);
+    const auto* dout = reinterpret_cast<const Element*>(params.dout_ptr);
+    auto* dq = reinterpret_cast<Element*>(params.dq_ptr);
+    auto* dk = reinterpret_cast<Element*>(params.dk_ptr);
+    auto* dv = reinterpret_cast<Element*>(params.dv_ptr);
     auto* delta = reinterpret_cast<float*>(params.delta_ptr);
     const int32_t q_rows = params.head_count * params.n_q;
     const int32_t q_tiles =
@@ -763,7 +810,7 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
     auto launch = [&]<int kPhase, bool AQ, bool AKV>(
                       const dim3& grid, const dim3& block) {
         hipLaunchKernelGGL(
-            (SevenGemmD64Kernel<kPhase, kNhd, AQ, AKV>),
+            (SevenGemmD64Kernel<Element, kPhase, kNhd, AQ, AKV>),
             grid,
             block,
             0,
@@ -822,7 +869,7 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
             (static_cast<uint32_t>(q_rows) + kRowsBlock - 1) /
             kRowsBlock);
         hipLaunchKernelGGL(
-            (DeltaKernel<kNhd>),
+            (DeltaKernel<Element, kNhd>),
             delta_grid,
             delta_block,
             0,
@@ -848,13 +895,21 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
     return hipPeekAtLastError() == hipSuccess;
 }
 
+template<typename Element>
+bool DispatchSevenGemm(const BackwardLaunchParams& params)
+{
+    return params.layout == 1 ? LaunchSevenGemmBackward<true, Element>(params)
+                              : LaunchSevenGemmBackward<false, Element>(params);
+}
+
 } // namespace
 
 extern "C" bool feather_attn_bwd_d64_fused(
     const BackwardLaunchParams& params)
 {
-    return params.layout == 1 ? LaunchSevenGemmBackward<true>(params)
-                              : LaunchSevenGemmBackward<false>(params);
+    return params.dtype == kBackwardDtypeBFloat16
+               ? DispatchSevenGemm<__bf16>(params)
+               : DispatchSevenGemm<_Float16>(params);
 }
 
 } // namespace feather_attn
