@@ -1,6 +1,8 @@
 import torch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
+from .aiter_tuning import install_aiter_tuned_configs
+
 
 def feather_attn(
     q: torch.Tensor,
@@ -217,6 +219,7 @@ def _aiter_attn_backward(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
+    install_aiter_tuned_configs(q.device)
     flash_attn_2.bwd(
         dout,
         q,
@@ -265,6 +268,7 @@ class _FeatherAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** -0.5
         softmax_scale = float(softmax_scale)
         window_size = (int(window_size[0]), int(window_size[1]))
+        install_aiter_tuned_configs(q.device)
         out, softmax_lse, s_dmask, rng_state = flash_attn_2.fwd(
             q,
             k,
