@@ -1,4 +1,5 @@
 import torch
+from torch.library import custom_op
 
 from .aiter_kernels import bwd_aiter_out, fwd_aiter_out
 from .aiter_vendored import fwd_out
@@ -64,6 +65,31 @@ def _is_bhsd_contiguous(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: 
     return True
 
 
+@custom_op("feather_attn::bwd_out", mutates_args={"dq", "dk", "dv", "delta", "dq_acc"})
+def _bwd_out(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    delta: torch.Tensor,
+    dq_acc: torch.Tensor | None,
+    softmax_scale: float,
+    layout_id: int,
+) -> None:
+    # The fused kernel is only built for head_dim 128, and measured slower than the split
+    # kernels for few heads / short keys. The key length is a runtime value under
+    # `torch.compile`, so the choice is made here instead of branching in the traced graph.
+    if q.shape[-1] == 128 and (layout_id == 0 or q.shape[2] >= 32 or k.shape[1] >= 8192):
+        torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, layout_id)
+    else:
+        torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, layout_id)
+
+
 def _feather_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -74,10 +100,6 @@ def _feather_bwd(
     softmax_scale: float,
 ):
     use_hnd = _is_bhsd_contiguous(q, k, v, out) or _use_force_hnd_bwd(q, k, v, out, dout)
-
-    # The fused kernel is only built for head_dim 128, and measured slower than the
-    # split kernels for few heads / short keys.
-    fused = q.shape[-1] == 128 and (use_hnd or q.shape[2] >= 32 or k.shape[1] >= 8192)
 
     delta = torch.empty(softmax_lse.shape, dtype=torch.float32, device=softmax_lse.device)
     softmax_lse = softmax_lse.contiguous()
@@ -91,11 +113,8 @@ def _feather_bwd(
         dq = torch.empty_like(q_h)
         dk = torch.empty_like(k_h)
         dv = torch.empty_like(v_h)
-        if fused:
-            dq_acc = torch.empty_like(q_h, dtype=torch.float32)
-            torch.ops.feather_attn.attn_bwd_feather_fused.default(dout_h, q_h, k_h, v_h, out_h, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 0)
-        else:
-            torch.ops.feather_attn.attn_bwd_feather.default(dout_h, q_h, k_h, v_h, out_h, softmax_lse, dq, dk, dv, delta, softmax_scale, 0)
+        dq_acc = torch.empty_like(q_h, dtype=torch.float32) if q_h.shape[-1] == 128 else None
+        _bwd_out(dout_h, q_h, k_h, v_h, out_h, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 0)
         return dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), delta
     else:
         dout = dout.contiguous()
@@ -106,11 +125,8 @@ def _feather_bwd(
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        if fused:
-            dq_acc = torch.empty_like(q, dtype=torch.float32)
-            torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 1)
-        else:
-            torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, 1)
+        dq_acc = torch.empty_like(q, dtype=torch.float32) if q.shape[-1] == 128 else None
+        _bwd_out(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, 1)
         return dq, dk, dv, delta
 
 
