@@ -122,6 +122,29 @@ def test_feather_attn_func_backward_matches_aiter(head_dim: int, dtype: torch.dt
         _assert_close(actual_grad, expected_grad)
 
 
+def test_feather_attn_func_gqa_backward_matches_aiter(monkeypatch) -> None:
+    torch.manual_seed(0)
+    batch, heads_q, heads_kv, seq_len, head_dim = 1, 8, 2, 256, 128
+    q = torch.randn((batch, seq_len, heads_q, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn((batch, seq_len, heads_kv, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn((batch, seq_len, heads_kv, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def fail_aiter_backward(*args, **kwargs):
+        raise AssertionError("GQA should use the FeatherAttn backward")
+
+    monkeypatch.setattr("feather_attn.ops._aiter_attn_backward", fail_aiter_backward)
+    out = feather_attn_func(q, k, v)
+    dout = torch.randn_like(out)
+    actual = torch.autograd.grad(out, (q, k, v), dout)
+
+    q_ref, k_ref, v_ref = (tensor.detach() for tensor in (q, k, v))
+    out_ref, lse_ref, _, _ = _aiter_forward(q_ref, k_ref, v_ref, head_dim**-0.5, False, (-1, -1), None)
+    expected = _aiter_backward(dout, q_ref, k_ref, v_ref, out_ref, lse_ref, head_dim**-0.5, False, (-1, -1), None, False)
+    _assert_close(out, out_ref)
+    for actual_grad, expected_grad in zip(actual, expected):
+        _assert_close(actual_grad, expected_grad)
+
+
 def test_feather_attn_func_falls_back_for_causal_gqa() -> None:
     torch.manual_seed(0)
     batch, heads_q, heads_kv, seq_len, head_dim = 1, 4, 2, 128, 64

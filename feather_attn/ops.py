@@ -378,6 +378,39 @@ class _FeatherAttnFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * (len(ctx.needs_input_grad) - 3))
 
 
+def _expand_gqa_for_feather_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    alibi_slopes: torch.Tensor | None,
+    deterministic: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.shape[2] == k.shape[2]:
+        return k, v
+    if v.shape[2] != k.shape[2] or q.shape[2] % k.shape[2] != 0 or q.shape[0] != k.shape[0] or q.shape[-1] != k.shape[-1] or k.shape[-1] != v.shape[-1]:
+        return k, v
+    if not (torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v))):
+        return k, v
+    if not (
+        dropout_p == 0.0
+        and not causal
+        and tuple(window_size) == (-1, -1)
+        and softcap == 0.0
+        and alibi_slopes is None
+        and not deterministic
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.shape[-1] in (64, 128)
+    ):
+        return k, v
+    group_size = q.shape[2] // k.shape[2]
+    return k.repeat_interleave(group_size, dim=2), v.repeat_interleave(group_size, dim=2)
+
+
 def feather_attn_func(
     q,
     k,
@@ -398,6 +431,7 @@ def feather_attn_func(
     pass uses the FeatherAttn kernels when the requested features are
     supported, otherwise it falls back to AITER's backward.
     """
+    k, v = _expand_gqa_for_feather_backward(q, k, v, dropout_p, causal, window_size, softcap, alibi_slopes, deterministic)
     return _FeatherAttnFunc.apply(
         q,
         k,
