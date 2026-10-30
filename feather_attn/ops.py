@@ -3,6 +3,7 @@ from torch.library import custom_op
 
 from .aiter_kernels import bwd_aiter_out, fwd_aiter_out
 from .aiter_vendored import fwd_out
+from .layout import to_hnd
 
 
 def feather_attn(
@@ -105,11 +106,11 @@ def _feather_bwd(
     softmax_lse = softmax_lse.contiguous()
 
     if use_hnd:
-        dout_h = dout.transpose(1, 2).contiguous()
-        q_h = q.transpose(1, 2).contiguous()
-        k_h = k.transpose(1, 2).contiguous()
-        v_h = v.transpose(1, 2).contiguous()
-        out_h = out.transpose(1, 2).contiguous()
+        dout_h = to_hnd(dout)
+        q_h = to_hnd(q)
+        k_h = to_hnd(k)
+        v_h = to_hnd(v)
+        out_h = to_hnd(out)
         dq = torch.empty_like(q_h)
         dk = torch.empty_like(k_h)
         dv = torch.empty_like(v_h)
