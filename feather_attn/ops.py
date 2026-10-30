@@ -1,6 +1,7 @@
 import torch
 
-from .kernels import bwd_aiter_out, fwd_out
+from .aiter_kernels import bwd_aiter_out, fwd_aiter_out
+from .aiter_vendored import fwd_out
 
 
 def feather_attn(
@@ -22,7 +23,7 @@ def feather_attn(
 
 
 # Benchmarked including all transpose and copy costs
-def _use_force_hnd_backward(
+def _use_force_hnd_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -63,7 +64,7 @@ def _is_bhsd_contiguous(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: 
     return True
 
 
-def _feather_backward(
+def _feather_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -72,7 +73,7 @@ def _feather_backward(
     softmax_lse: torch.Tensor,
     softmax_scale: float,
 ):
-    use_hnd = _is_bhsd_contiguous(q, k, v, out) or _use_force_hnd_backward(q, k, v, out, dout)
+    use_hnd = _is_bhsd_contiguous(q, k, v, out) or _use_force_hnd_bwd(q, k, v, out, dout)
 
     # The fused kernel is only built for head_dim 128, and measured slower than the
     # split kernels for few heads / short keys.
@@ -113,7 +114,7 @@ def _feather_backward(
         return dq, dk, dv, delta
 
 
-def feather_attn_backward(
+def feather_attn_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -127,7 +128,7 @@ def feather_attn_backward(
         softmax_scale = q.shape[-1] ** -0.5
 
     if layout == "HND":
-        dq, dk, dv, delta = _feather_backward(
+        dq, dk, dv, delta = _feather_bwd(
             dout.transpose(1, 2),
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -140,10 +141,10 @@ def feather_attn_backward(
 
     if layout != "NHD":
         raise ValueError(f"layout must be 'HND' or 'NHD', got {layout}")
-    return _feather_backward(dout, q, k, v, out, softmax_lse, float(softmax_scale))
+    return _feather_bwd(dout, q, k, v, out, softmax_lse, float(softmax_scale))
 
 
-def _supports_feather_backward(
+def _supports_feather_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -168,7 +169,7 @@ def _batch_and_head_dim_match(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     return q.shape[0] == k.shape[0] == v.shape[0] and q.shape[-1] == k.shape[-1] == v.shape[-1]
 
 
-def _can_use_feather_backward(
+def _can_use_feather_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -177,10 +178,15 @@ def _can_use_feather_backward(
     window_size: tuple[int, int],
     alibi_slopes: torch.Tensor | None,
 ) -> bool:
-    return _batch_and_head_dim_match(q, k, v) and q.shape[2] == k.shape[2] == v.shape[2] and _supports_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
+    return (
+        _batch_and_head_dim_match(q, k, v)
+        and k.shape[2] == v.shape[2]
+        and q.shape[2] % k.shape[2] == 0
+        and _supports_feather_bwd(q, k, v, dropout_p, causal, window_size, alibi_slopes)
+    )
 
 
-def _aiter_backward(
+def _aiter_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -235,34 +241,35 @@ class _FeatherAttnFunc(torch.autograd.Function):
         is_grad = q.requires_grad or k.requires_grad or v.requires_grad
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
-        softmax_scale = float(softmax_scale)
-        dropout_p = float(dropout_p)
-        window_size = (int(window_size[0]), int(window_size[1]))
 
         batch, seqlen_q, nheads_q, _ = q.shape
         out = torch.empty_like(q)
-        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        softmax_lse = torch.empty((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
         needs_scores = return_attn_probs or dropout_p > 0.0
-        sd_mask = torch.zeros((batch, nheads_q, seqlen_q, k.shape[1]), device=q.device, dtype=torch.float32) if needs_scores else None
-        fwd_out(
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            sd_mask,
-            alibi_slopes,
-            softmax_scale,
-            causal,
-            window_size[0],
-            window_size[1],
-            dropout_p,
-            return_attn_probs,
-        )
+        if needs_scores or causal or alibi_slopes is not None or window_size != (-1, -1):
+            sd_mask = torch.zeros((batch, nheads_q, seqlen_q, k.shape[1]), device=q.device, dtype=torch.float32) if needs_scores else None
+            fwd_aiter_out(
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                sd_mask,
+                alibi_slopes,
+                softmax_scale,
+                causal,
+                window_size[0],
+                window_size[1],
+                dropout_p,
+                return_attn_probs,
+            )
+        else:
+            sd_mask = None
+            fwd_out(q, k, v, out, softmax_lse, softmax_scale)
 
-        use_feather_backward = is_grad and _can_use_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
-        if use_feather_backward:
-            use_feather_backward = out.shape == q.shape and softmax_lse.shape == (q.shape[0], q.shape[2], q.shape[1])
+        use_feather_bwd = is_grad and _can_use_feather_bwd(q, k, v, dropout_p, causal, window_size, alibi_slopes)
+        if use_feather_bwd:
+            use_feather_bwd = out.shape == q.shape and softmax_lse.shape == (q.shape[0], q.shape[2], q.shape[1])
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -271,7 +278,7 @@ class _FeatherAttnFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
-            ctx.use_feather_backward = use_feather_backward
+            ctx.use_feather_bwd = use_feather_bwd
 
         if return_attn_probs:
             return out, softmax_lse, sd_mask
@@ -281,10 +288,19 @@ class _FeatherAttnFunc(torch.autograd.Function):
     def backward(ctx, *grad_outputs):
         dout = grad_outputs[0]
         q, k, v, out, softmax_lse = ctx.saved_tensors
-        if ctx.use_feather_backward:
-            dq, dk, dv, _ = _feather_backward(dout, q, k, v, out, softmax_lse, ctx.softmax_scale)
+        if ctx.use_feather_bwd:
+            group_size = q.shape[2] // k.shape[2]
+            if group_size > 1:
+                k_expanded = k.repeat_interleave(group_size, dim=2)
+                v_expanded = v.repeat_interleave(group_size, dim=2)
+                dq, dk_expanded, dv_expanded, _ = _feather_bwd(dout, q, k_expanded, v_expanded, out, softmax_lse, ctx.softmax_scale)
+                batch, seqlen_k, _, head_dim = dk_expanded.shape
+                dk = dk_expanded.view(batch, seqlen_k, k.shape[2], group_size, head_dim).sum(3)
+                dv = dv_expanded.view(batch, seqlen_k, v.shape[2], group_size, head_dim).sum(3)
+            else:
+                dq, dk, dv, _ = _feather_bwd(dout, q, k, v, out, softmax_lse, ctx.softmax_scale)
         else:
-            dq, dk, dv = _aiter_backward(
+            dq, dk, dv = _aiter_bwd(
                 dout,
                 q,
                 k,
@@ -298,28 +314,6 @@ class _FeatherAttnFunc(torch.autograd.Function):
                 ctx.alibi_slopes,
             )
         return dq, dk, dv, *((None,) * (len(ctx.needs_input_grad) - 3))
-
-
-def _expand_gqa_for_feather_backward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    causal: bool,
-    window_size: tuple[int, int],
-    alibi_slopes: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    group_size = q.shape[2] // k.shape[2]
-    if (
-        q.shape[2] % k.shape[2]
-        or q.shape[2] == k.shape[2]
-        or k.shape[2] != v.shape[2]
-        or not _batch_and_head_dim_match(q, k, v)
-        or not (torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v)))
-        or not _supports_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
-    ):
-        return k, v
-    return k.repeat_interleave(group_size, dim=2), v.repeat_interleave(group_size, dim=2)
 
 
 def feather_attn_func(
@@ -337,24 +331,22 @@ def feather_attn_func(
 ):
     """FlashAttention 2-compatible dense attention with FeatherAttn backward.
 
-    Q/K/V use FlashAttention's BSHD logical layout.
-    The forward pass uses AITER's FlashAttention Triton kernel. The backward
-    pass uses the FeatherAttn kernels when the requested features are
-    supported, otherwise it falls back to AITER's backward.
+    Q/K/V use FlashAttention's BSHD logical layout. The forward keeps GQA natively
+    (k/v may have fewer heads), the backward expands k/v for the FeatherAttn kernels
+    when the requested features are supported and otherwise falls back to AITER.
     """
     if softcap != 0.0:
         raise NotImplementedError("softcap is not supported")
     if deterministic:
         raise NotImplementedError("deterministic=True is not supported")
-    k, v = _expand_gqa_for_feather_backward(q, k, v, dropout_p, causal, window_size, alibi_slopes)
     return _FeatherAttnFunc.apply(
         q,
         k,
         v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
+        float(dropout_p),
+        float(softmax_scale) if softmax_scale is not None else None,
+        bool(causal),
+        (int(window_size[0]), int(window_size[1])),
         alibi_slopes,
         return_attn_probs,
     )

@@ -4,7 +4,7 @@ import pytest
 import torch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
-from feather_attn import feather_attn_backward
+from feather_attn import feather_attn_bwd
 
 LAYOUTS = ("HND", "NHD")
 DTYPES = ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))
@@ -24,7 +24,7 @@ D64_SHAPES = (
 HEAD_DIMS = (64, 128)
 
 
-def _backward_cases() -> tuple[object, ...]:
+def _bwd_cases() -> tuple[object, ...]:
     return tuple(
         pytest.param(
             dtype,
@@ -127,9 +127,9 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor, n_kv: int) -> No
 
 @pytest.mark.parametrize(
     ("dtype", "layout", "batch", "heads", "n_q", "n_kv", "head_dim"),
-    _backward_cases(),
+    _bwd_cases(),
 )
-def test_feather_attn_backward_matches_saved_state_reference(
+def test_feather_attn_bwd_matches_saved_state_reference(
     dtype: torch.dtype,
     layout: str,
     batch: int,
@@ -142,7 +142,7 @@ def test_feather_attn_backward_matches_saved_state_reference(
         state = _saved_state(batch, heads, n_q, n_kv, head_dim, seed=0, layout=layout, dtype=dtype)
         q, k, v, out, lse, dout, scale = state
         expected = _reference(q, k, v, out, lse, dout, scale, layout)
-        actual = feather_attn_backward(dout, q, k, v, out, lse, softmax_scale=scale, layout=layout)
+        actual = feather_attn_bwd(dout, q, k, v, out, lse, softmax_scale=scale, layout=layout)
         assert all(result.dtype == dtype for result in actual[:3])
         assert actual[3].dtype == torch.float32
         for result, reference in zip(actual, expected):
@@ -151,7 +151,7 @@ def test_feather_attn_backward_matches_saved_state_reference(
 
 @pytest.mark.parametrize("dtype", [pytest.param(dtype, id=name) for dtype, name in DTYPES])
 @pytest.mark.parametrize("head_dim", HEAD_DIMS, ids=lambda head_dim: f"D{head_dim}")
-def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -> None:
+def test_nhd_hnd_bwd_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -> None:
     with torch.inference_mode():
         q, k, v, out, lse, dout, scale = _saved_state(1, 32, 8192, 8192, head_dim, seed=0, layout="NHD", dtype=dtype)
         direct = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
@@ -184,7 +184,7 @@ def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -
                 scale,
                 1,
             )
-        selected = feather_attn_backward(dout, q, k, v, out, lse, softmax_scale=scale)
+        selected = feather_attn_bwd(dout, q, k, v, out, lse, softmax_scale=scale)
         if head_dim == 128:
             _assert_close(selected[0], direct[0], q.shape[1])
             assert torch.equal(selected[1], direct[1])
@@ -195,11 +195,11 @@ def test_nhd_hnd_backward_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -
                 assert torch.equal(actual, expected)
 
 
-def test_backward_rejects_mixed_attention_dtypes() -> None:
+def test_bwd_rejects_mixed_attention_dtypes() -> None:
     with torch.inference_mode():
         q, k, v, out, lse, dout, scale = _saved_state(1, 8, 128, 128, 64, seed=0, layout="HND", dtype=torch.float16)
         with pytest.raises(RuntimeError, match="same dtype"):
-            feather_attn_backward(
+            feather_attn_bwd(
                 dout,
                 q,
                 k.to(torch.bfloat16),

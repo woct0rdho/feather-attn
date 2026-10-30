@@ -8,7 +8,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from feather_attn import feather_attn_func
 
 
-def _aiter_forward(
+def _aiter_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -33,7 +33,7 @@ def _aiter_forward(
     )
 
 
-def _aiter_backward(
+def _aiter_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -85,7 +85,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     "dtype",
     [pytest.param(torch.float16, id="fp16"), pytest.param(torch.bfloat16, id="bf16")],
 )
-def test_feather_attn_func_backward_matches_aiter(head_dim: int, dtype: torch.dtype) -> None:
+def test_feather_attn_func_bwd_matches_aiter(head_dim: int, dtype: torch.dtype) -> None:
     torch.manual_seed(0)
     batch, seq_len, heads = 1, 512, 8
     shape = (batch, seq_len, heads, head_dim)
@@ -96,7 +96,7 @@ def test_feather_attn_func_backward_matches_aiter(head_dim: int, dtype: torch.dt
     dout = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), dout)
     q_ref, k_ref, v_ref = (tensor.detach() for tensor in (q, k, v))
-    out_ref, lse_ref, _, _ = _aiter_forward(
+    out_ref, lse_ref, _, _ = _aiter_fwd(
         q_ref,
         k_ref,
         v_ref,
@@ -105,7 +105,7 @@ def test_feather_attn_func_backward_matches_aiter(head_dim: int, dtype: torch.dt
         (-1, -1),
         None,
     )
-    expected = _aiter_backward(
+    expected = _aiter_bwd(
         dout,
         q_ref,
         k_ref,
@@ -122,24 +122,24 @@ def test_feather_attn_func_backward_matches_aiter(head_dim: int, dtype: torch.dt
         _assert_close(actual_grad, expected_grad)
 
 
-def test_feather_attn_func_gqa_backward_matches_aiter(monkeypatch) -> None:
+def test_feather_attn_func_gqa_bwd_matches_aiter(monkeypatch) -> None:
     torch.manual_seed(0)
     batch, heads_q, heads_kv, seq_len, head_dim = 1, 8, 2, 256, 128
     q = torch.randn((batch, seq_len, heads_q, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn((batch, seq_len, heads_kv, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn((batch, seq_len, heads_kv, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-    def fail_aiter_backward(*args, **kwargs):
+    def fail_aiter_bwd(*args, **kwargs):
         raise AssertionError("GQA should use the FeatherAttn backward")
 
-    monkeypatch.setattr("feather_attn.ops._aiter_backward", fail_aiter_backward)
+    monkeypatch.setattr("feather_attn.ops._aiter_bwd", fail_aiter_bwd)
     out = feather_attn_func(q, k, v)
     dout = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), dout)
 
     q_ref, k_ref, v_ref = (tensor.detach() for tensor in (q, k, v))
-    out_ref, lse_ref, _, _ = _aiter_forward(q_ref, k_ref, v_ref, head_dim**-0.5, False, (-1, -1), None)
-    expected = _aiter_backward(dout, q_ref, k_ref, v_ref, out_ref, lse_ref, head_dim**-0.5, False, (-1, -1), None, False)
+    out_ref, lse_ref, _, _ = _aiter_fwd(q_ref, k_ref, v_ref, head_dim**-0.5, False, (-1, -1), None)
+    expected = _aiter_bwd(dout, q_ref, k_ref, v_ref, out_ref, lse_ref, head_dim**-0.5, False, (-1, -1), None, False)
     _assert_close(out, out_ref)
     for actual_grad, expected_grad in zip(actual, expected):
         _assert_close(actual_grad, expected_grad)
@@ -155,7 +155,7 @@ def test_feather_attn_func_falls_back_for_causal_gqa() -> None:
     dout = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), dout)
     q_ref, k_ref, v_ref = (tensor.detach() for tensor in (q, k, v))
-    out_ref, lse_ref, _, _ = _aiter_forward(
+    out_ref, lse_ref, _, _ = _aiter_fwd(
         q_ref,
         k_ref,
         v_ref,
@@ -164,7 +164,7 @@ def test_feather_attn_func_falls_back_for_causal_gqa() -> None:
         (-1, -1),
         None,
     )
-    expected = _aiter_backward(
+    expected = _aiter_bwd(
         dout,
         q_ref,
         k_ref,
@@ -213,7 +213,7 @@ def test_feather_attn_func_falls_back_for_window() -> None:
     dout = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), dout)
     q_ref, k_ref, v_ref = (tensor.detach() for tensor in (q, k, v))
-    out_ref, lse_ref, _, _ = _aiter_forward(
+    out_ref, lse_ref, _, _ = _aiter_fwd(
         q_ref,
         k_ref,
         v_ref,
@@ -222,7 +222,7 @@ def test_feather_attn_func_falls_back_for_window() -> None:
         window_size,
         None,
     )
-    expected = _aiter_backward(
+    expected = _aiter_bwd(
         dout,
         q_ref,
         k_ref,
@@ -239,7 +239,7 @@ def test_feather_attn_func_falls_back_for_window() -> None:
         _assert_close(actual_grad, expected_grad)
 
 
-def test_feather_attn_func_dropout_backward_is_finite() -> None:
+def test_feather_attn_func_dropout_bwd_is_finite() -> None:
     torch.manual_seed(0)
     shape = (1, 128, 2, 64)
     q = torch.randn(shape, device="cuda", dtype=torch.float16, requires_grad=True)
@@ -281,14 +281,14 @@ def test_feather_attn_func_physical_bhsd_uses_hnd_without_layout_copy(head_dim: 
     q = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
     k = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
     v = torch.randn((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16, requires_grad=True).transpose(1, 2)
-    with patch("feather_attn.ops._aiter_backward", side_effect=AssertionError("unexpected AITER fallback")):
+    with patch("feather_attn.ops._aiter_bwd", side_effect=AssertionError("unexpected AITER fallback")):
         out = feather_attn_func(q, k, v)
         dout = torch.randn_like(out)
         actual = torch.autograd.grad(out, (q, k, v), dout)
         assert out.stride() == q.stride()
         assert all(gradient.stride() == q.stride() for gradient in actual)
         q_ref, k_ref, v_ref = (tensor.detach().contiguous() for tensor in (q, k, v))
-        out_ref, lse_ref, _, _ = _aiter_forward(
+        out_ref, lse_ref, _, _ = _aiter_fwd(
             q_ref,
             k_ref,
             v_ref,
@@ -297,7 +297,7 @@ def test_feather_attn_func_physical_bhsd_uses_hnd_without_layout_copy(head_dim: 
             (-1, -1),
             None,
         )
-        expected = _aiter_backward(
+        expected = _aiter_bwd(
             dout.contiguous(),
             q_ref,
             k_ref,

@@ -10,11 +10,9 @@ from pathlib import Path
 
 import torch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import (
-    attention_backward_triton_impl,
-)
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import attention_backward_triton_impl
 
-from feather_attn import feather_attn_backward
+from feather_attn import feather_attn_bwd
 
 BATCH = 1
 DTYPE = torch.float16
@@ -91,7 +89,7 @@ class Provider:
     def launch(self) -> None:
         x = self.state
         if self.name == "feather":
-            feather_attn_backward(
+            feather_attn_bwd(
                 x.dout,
                 x.q,
                 x.k,

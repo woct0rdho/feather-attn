@@ -9,12 +9,12 @@ from feather_attn import feather_attn_func
 DTYPE = torch.bfloat16
 
 
-def _aiter_forward(q, k, v, scale, causal):
+def _aiter_fwd(q, k, v, scale, causal):
     out, lse, _, _ = flash_attn_2.fwd(q, k, v, None, None, 0.0, scale, causal, -1, -1, 0.0, False)
     return out, lse
 
 
-def _aiter_backward(dout, q, k, v, out, lse, scale, causal):
+def _aiter_bwd(dout, q, k, v, out, lse, scale, causal):
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
@@ -36,9 +36,9 @@ def _reference(q, k, v, causal, gqa, head_dim):
     batch, seqlen_k, heads_kv, _ = k.shape
     k_ref = k.detach().repeat_interleave(gqa, dim=2)
     v_ref = v.detach().repeat_interleave(gqa, dim=2)
-    out_ref, lse_ref = _aiter_forward(q.detach(), k_ref, v_ref, scale, causal)
+    out_ref, lse_ref = _aiter_fwd(q.detach(), k_ref, v_ref, scale, causal)
     dout = torch.ones_like(out_ref)
-    dq, dk, dv = _aiter_backward(dout, q.detach(), k_ref, v_ref, out_ref, lse_ref, scale, causal)
+    dq, dk, dv = _aiter_bwd(dout, q.detach(), k_ref, v_ref, out_ref, lse_ref, scale, causal)
     if gqa > 1:
         dk = dk.view(batch, seqlen_k, heads_kv, gqa, head_dim).sum(3)
         dv = dv.view(batch, seqlen_k, heads_kv, gqa, head_dim).sum(3)
@@ -63,10 +63,6 @@ def _assert_close(actual, expected, rtol=2e-2):
     ids=lambda value: value if isinstance(value, str) else "",
 )
 def test_compiled_matches_aiter(label, kwargs) -> None:
-    """fullgraph compile keeps numerics (against AITER) for every dispatch path."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU")
-
     q, k, v = _case(**kwargs)
     out_ref, grads_ref, dout = _reference(q, k, v, kwargs["causal"], kwargs["gqa"], kwargs["head_dim"])
 
@@ -75,17 +71,13 @@ def test_compiled_matches_aiter(label, kwargs) -> None:
 
     compiled = torch.compile(run, fullgraph=True)
     out = compiled(q, k, v)
-    assert torch.equal(out, out_ref), f"{label}: forward differs from AITER"
+    assert torch.allclose(out, out_ref, atol=1e-2, rtol=2e-2), f"{label}: forward differs from AITER"
     grads = torch.autograd.grad(out, (q, k, v), dout)
     for actual, expected in zip(grads, grads_ref):
         _assert_close(actual, expected)
 
 
 def test_compiled_has_no_graph_breaks_and_hoists_allocations() -> None:
-    """The attention body is traced: buffers are graph allocations, kernels are visible."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU")
-
     q, k, v = _case(1, 256, 256, 8, 128, False, 1)
 
     def run(qq, kk, vv):
@@ -98,23 +90,31 @@ def test_compiled_has_no_graph_breaks_and_hoists_allocations() -> None:
     text = "\n".join(code)
     # out/softmax_lse are allocated by the graph (Inductor buffer), not inside the op
     assert "empty_strided" in text
-    # the AITER forward kernel is codegen'd by Inductor with its autotune config space
+    # the vendored forward kernel is codegen'd by Inductor with its autotune config space
     assert "user_autotune" in text
-    assert "attn_fwd" in text
+    assert "_attn_fwd" in text
 
 
-def test_compiled_backward_uses_triton_kernels() -> None:
-    """AITER's Triton backward fallback is also captured (not opaque)."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU")
-
-    q, k, v = _case(1, 128, 128, 8, 128, False, 1)
-
+def test_dynamic_shapes_share_one_graph() -> None:
     def run(qq, kk, vv):
-        # causal forces AITER's Triton backward
-        return feather_attn_func(qq, kk, vv, softmax_scale=128**-0.5, causal=True)
+        return feather_attn_func(qq, kk, vv, softmax_scale=128**-0.5)
 
-    out, code = run_and_get_code(torch.compile(run, fullgraph=True), q, k, v)
-    out.sum().backward()
+    torch._dynamo.reset()
+    graphs_before = torch._dynamo.utils.counters["stats"].get("unique_graphs", 0)
+    compiled = torch.compile(run, fullgraph=True, dynamic=True)
+    for seqlen in (512, 768, 384, 1024):
+        q, k, v = _case(1, seqlen, seqlen, 8, 128, False, 1)
+        out = compiled(q, k, v)
+        out_ref, _, _ = _reference(q, k, v, False, 1, 128)
+        assert torch.allclose(out, out_ref, atol=1e-2, rtol=2e-2)
+
+    unique_graphs = torch._dynamo.utils.counters["stats"].get("unique_graphs", 0) - graphs_before
+    # one graph for the forward and one for the backward serve every sequence length
+    assert 0 < unique_graphs <= 4, f"unique_graphs for 4 sequence lengths = {unique_graphs}"
+
+
+def test_gqa_fwd_does_not_expand_kv() -> None:
+    q, k, v = _case(1, 256, 256, 48, 128, False, 4)
+    _, code = run_and_get_code(torch.compile(lambda a, b, c: feather_attn_func(a, b, c, softmax_scale=128**-0.5), fullgraph=True), q, k, v)
     text = "\n".join(code)
-    assert "attn_fwd" in text
+    assert "repeat_interleave" not in text
