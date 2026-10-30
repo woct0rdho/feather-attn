@@ -2,15 +2,9 @@ from itertools import product
 
 import pytest
 import torch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
-from feather_attn import feather_attn
-
-flash_attn_amd = pytest.importorskip(
-    "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
-    reason="AITER is required as the attention reference",
-)
-flash_attn_2 = flash_attn_amd.flash_attn_2
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU is required")
+from feather_attn.ops import feather_attn
 
 BATCH = 1
 BENCHMARK_HEAD_COUNTS = (16, 32, 56)

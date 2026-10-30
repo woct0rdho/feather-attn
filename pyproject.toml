@@ -9,7 +9,7 @@ description = "Fast attention for RDNA3/3.5"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-# We deliberately avoid declaring torch as a dependency because it's nontrivial to install
+# We deliberately avoid declaring aiter and torch as dependencies because they're nontrivial to install
 dependencies = []
 
 [tool.ruff]

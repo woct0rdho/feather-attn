@@ -7,7 +7,7 @@ import torch
 import triton
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
-from feather_attn import feather_attn
+from feather_attn.ops import feather_attn
 
 BATCH = 1
 BENCHMARK_HEAD_COUNTS = [16, 32, 56]

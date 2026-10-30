@@ -2,15 +2,9 @@ from itertools import product
 
 import pytest
 import torch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
 from feather_attn import feather_attn_backward
-
-flash_attn_amd = pytest.importorskip(
-    "aiter.ops.triton._triton_kernels.flash_attn_triton_amd",
-    reason="AITER is required to construct the saved forward state",
-)
-flash_attn_2 = flash_attn_amd.flash_attn_2
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU is required")
 
 LAYOUTS = ("HND", "NHD")
 DTYPES = ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))

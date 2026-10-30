@@ -127,12 +127,7 @@ __device__ inline void WmmaInPlace(
 
 __device__ inline void NativeAtomicAdd(float* address, float value)
 {
-#if defined(__gfx1151__) && \
-    __has_builtin(__builtin_amdgcn_global_atomic_fadd_f32)
     (void)__builtin_amdgcn_global_atomic_fadd_f32(address, value);
-#else
-    atomicAdd(address, value);
-#endif
 }
 
 template<typename Element>
