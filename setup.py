@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shlex
 import shutil
@@ -47,6 +48,17 @@ def _enable_ccache() -> None:
                 break
 
 
+def _rocm_devel_root() -> Path:
+    if importlib.util.find_spec("rocm_sdk._devel") is not None:
+        from rocm_sdk._devel import get_devel_root
+
+        return Path(get_devel_root())
+
+    if cpp_extension.ROCM_HOME is None:
+        raise RuntimeError("Cannot locate the ROCm development tree. Install rocm-sdk-devel or set ROCM_HOME/ROCM_PATH.")
+    return Path(cpp_extension.ROCM_HOME)
+
+
 def _ck_include_dir() -> Path:
     root = Path(
         os.environ.get(
@@ -61,25 +73,13 @@ def _ck_include_dir() -> Path:
     return include
 
 
-def _rocm_sdk_core_include() -> Path | None:
-    try:
-        import _rocm_sdk_core
-    except ImportError:
-        return None
-    assert _rocm_sdk_core.__file__ is not None
-    include = Path(_rocm_sdk_core.__file__).resolve().parent / "include"
-    return include if include.is_dir() else None
-
-
 if not cpp_extension.IS_HIP_EXTENSION:
     raise RuntimeError("feather-attn requires a ROCm-enabled PyTorch build.")
 
 _enable_ccache()
 
-include_dirs = [str(CSRC), str(_ck_include_dir())]
-rocm_sdk_core_include = _rocm_sdk_core_include()
-if rocm_sdk_core_include is not None:
-    include_dirs.append(str(rocm_sdk_core_include))
+rocm_include_dir = _rocm_devel_root() / "include"
+include_dirs = [str(CSRC), str(rocm_include_dir), str(_ck_include_dir())]
 
 stable_defines = [
     "-DTORCH_TARGET_VERSION=0x020A000000000000",
@@ -111,6 +111,11 @@ hip_flags = [
 ]
 
 setup(
+    # `package_dir` maps the root package to the repository root, which makes the layout
+    # "simple" in setuptools' terms: an editable install then extends `sys.path` with a plain
+    # path instead of installing an import hook that static analysis tools cannot follow. The
+    # mapping must be `.`, because an empty string is taken as the egg base by `egg_info`.
+    package_dir={"": "."},
     packages=find_packages(exclude=("bench", "tests")),
     ext_modules=[
         cpp_extension.CUDAExtension(
