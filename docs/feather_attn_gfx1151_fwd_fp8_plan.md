@@ -129,7 +129,7 @@ The maximum SGPR count is 46. Base kernels use 56-byte arguments. Strided D64 NH
 
 ### Method
 
-The authoritative matrix uses batch one, heads `{16,32,56}`, sequence lengths `{4096,8192,16384}`, D `{64,128}`, and both physical layouts. Each provider uses `triton.testing.do_bench` with `warmup=25` and `rep=100`.
+The authoritative matrix uses batch one, heads `{16,32,56}`, sequence lengths `{4096,8192,16384}`, D `{64,128}`, and both physical layouts. Timing now goes through the shared protocol in `bench/protocol.py`: warmup, then rounds of an adaptive batch of launches per provider, providers interleaved with alternating order, median over rounds with a p20/p80 spread, and the ratio against AITER taken as a paired median. The matrix below was recorded under the older `triton.testing.do_bench` recipe and is kept as recorded.
 
 Forward throughput counts the two attention GEMMs:
 

@@ -128,5 +128,5 @@ def test_feather_attn_matches_aiter(
 
         assert torch.isfinite(actual).all()
         assert torch.all(difference.abs() <= tolerance), (
-            f"rel_l2={rel_l2:.3g} max_abs={max_abs:.3g} gate={tolerance_factor:.2f}/{tolerance_factor:.2f} tol_ratio={tolerance_ratio:.3g}"
+            f"rel_l2={rel_l2:.3g} max_abs={max_abs:.3g} gate={tolerance_factor:.3f}/{tolerance_factor:.3f} tol_ratio={tolerance_ratio:.3g}"
         )

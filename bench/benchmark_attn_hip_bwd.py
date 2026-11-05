@@ -12,6 +12,7 @@ import torch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import attention_backward_triton_impl
 
+from bench.protocol import Case, measure, speedup
 from feather_attn import feather_attn_bwd
 
 BATCH = 1
@@ -132,34 +133,17 @@ class Provider:
             raise ValueError(f"unknown provider: {self.name}")
 
 
-def _percentile(values: list[float], quantile: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
-
-
-def _timed_launch(provider: Provider) -> float:
-    begin = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    begin.record()
-    provider.launch()
-    end.record()
-    end.synchronize()
-    return float(begin.elapsed_time(end))
-
-
-def _timing(samples: list[float], flops_f7: float, flops_pipeline: float) -> dict[str, object]:
-    median_ms = statistics.median(samples)
+def _timing(measurements, flops_f7: float, flops_pipeline: float) -> dict[str, object]:
     return {
-        "median_ms": median_ms,
-        "p20_ms": _percentile(samples, 0.2),
-        "p80_ms": _percentile(samples, 0.8),
-        "tflops_f7": flops_f7 / (median_ms * 1.0e9),
-        "tflops_pipeline": flops_pipeline / (median_ms * 1.0e9),
-        "samples_ms": samples,
+        name: {
+            "median_ms": measurement.median_ms,
+            "p20_ms": measurement.p20_ms,
+            "p80_ms": measurement.p80_ms,
+            "tflops_f7": flops_f7 / (measurement.median_ms * 1.0e9),
+            "tflops_pipeline": flops_pipeline / (measurement.median_ms * 1.0e9),
+            "samples_ms": list(measurement.samples_ms),
+        }
+        for name, measurement in measurements.items()
     }
 
 
@@ -173,25 +157,10 @@ def _run_shape(
 ) -> dict[str, object]:
     state = _saved_state(heads, seq_len, seed, layout)
     providers = {name: Provider(name, state) for name in PROVIDERS}
-    for provider in providers.values():
-        provider.launch()
-    torch.cuda.synchronize()
-    for repeat in range(warmups):
-        order = PROVIDERS if repeat % 2 == 0 else tuple(reversed(PROVIDERS))
-        for name in order:
-            providers[name].launch()
-    torch.cuda.synchronize()
-
-    samples = {name: [] for name in PROVIDERS}
-    for repeat in range(repeats):
-        order = PROVIDERS if repeat % 2 == 0 else tuple(reversed(PROVIDERS))
-        for name in order:
-            samples[name].append(_timed_launch(providers[name]))
-
+    case = Case(f"H={heads} N={seq_len} D={HEAD_DIM} {layout}", {name: provider.launch for name, provider in providers.items()})
+    measurements = measure(case.providers, warmup=warmups, rounds=repeats)
     flops_f7 = 14.0 * BATCH * heads * seq_len * seq_len * HEAD_DIM
     flops_pipeline = 2.0 * GEMM_COUNT * BATCH * heads * seq_len * seq_len * HEAD_DIM
-    timings = {name: _timing(samples[name], flops_f7, flops_pipeline) for name in PROVIDERS}
-    paired = [aiter_ms / feather_ms for aiter_ms, feather_ms in zip(samples["aiter"], samples["feather"])]
     return {
         "shape": {
             "batch": BATCH,
@@ -202,10 +171,10 @@ def _run_shape(
             "layout": layout,
         },
         "seed": seed,
-        "timings": timings,
-        "feather_over_aiter": _percentile(paired, 0.5),
-        "paired_ratio_p20": _percentile(paired, 0.2),
-        "paired_ratio_p80": _percentile(paired, 0.8),
+        "timings": _timing(measurements, flops_f7, flops_pipeline),
+        "feather_over_aiter": speedup(measurements["feather"], measurements["aiter"]),
+        "paired_ratio_p20": measurements["aiter"].p20_ms / measurements["feather"].p80_ms,
+        "paired_ratio_p80": measurements["aiter"].p80_ms / measurements["feather"].p20_ms,
     }
 
 
@@ -277,16 +246,8 @@ def _write_result(
 def main() -> None:
     global HEAD_DIM, GEMM_COUNT, DTYPE, DTYPE_NAME
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--shapes",
-        default="default",
-        help="comma-separated HxN rows, or 'default' for the primary matrix",
-    )
-    parser.add_argument(
-        "--layouts",
-        default=",".join(LAYOUTS),
-        help="comma-separated physical layouts (HND and/or NHD)",
-    )
+    parser.add_argument("--shapes", default="default", help="comma-separated HxN rows, or 'default' for the primary matrix")
+    parser.add_argument("--layouts", default=",".join(LAYOUTS), help="comma-separated physical layouts (HND and/or NHD)")
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default=DTYPE_NAME)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=HEAD_DIM)
     parser.add_argument("--gemm-count", type=int, choices=(5, 6, 7, 8), default=GEMM_COUNT)
@@ -333,7 +294,7 @@ def main() -> None:
 
     ratios = _speedups(rows)
     geometric_mean = math.exp(statistics.fmean(math.log(ratio) for ratio in ratios))
-    print(f"Summary: Feather/AITER={geometric_mean:.6f}x wins={sum(ratio > 1.0 for ratio in ratios)}/{len(rows)}")
+    print(f"Summary: Feather/AITER={geometric_mean:.3f}x wins={sum(ratio > 1.0 for ratio in ratios)}/{len(rows)}")
 
 
 if __name__ == "__main__":

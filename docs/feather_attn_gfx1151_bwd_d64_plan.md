@@ -78,14 +78,14 @@ Resource counts are for the FP16 instantiation. BF16 uses the same LDS layout.
 
 ## Benchmark and Correctness
 
-`bench/benchmark_attn_hip_backward.py` reports `F7`/`F_actual` for D64. D64 executes seven GEMMs, so F7 and F_actual are the same:
+`bench/benchmark_attn_hip_bwd.py` reports `F7`/`F_actual` for D64. D64 executes seven GEMMs, so F7 and F_actual are the same:
 
 ```text
 F7 = F_actual = 7 * 2 * B * H * NQ * NKV * D
 F5 = 5/7 * F7  # reporting cross-check only
 ```
 
-The production matrix uses five warmups and ten repeats, complete provider timing, and the same paired AITER control.
+The production matrix uses the shared protocol in `bench/protocol.py` (warmup, then rounds of an adaptive batch of launches per provider, providers interleaved with alternating order), with the paired AITER control and the p20/p80 spread reported next to every median. The matrix below predates that protocol and is kept as recorded. Re-run `python -m bench.benchmark_attn_hip_bwd --output <path>` to reproduce it under the current one.
 
 Both dtype instantiations use the same kernel topology. A same-process A/B screen measured BF16/FP16 between `1.01x` and `1.05x` across D64 HND/NHD. No separate BF16 matrix is retained. Use `--dtype bf16` to select BF16 in the benchmark.
 
