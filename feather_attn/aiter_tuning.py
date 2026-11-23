@@ -1,7 +1,7 @@
 import functools
 
 import triton
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, fwd_prefill
+from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, fwd_prefill
 
 # (BLOCK_M, BLOCK_N, num_warps, num_stages, waves_per_eu, PRE_LOAD_V)
 _FWD_TILES: dict[int, tuple] = {

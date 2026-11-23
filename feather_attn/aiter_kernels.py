@@ -1,7 +1,7 @@
 import torch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd as _bwd_mod
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import fwd_prefill as _fwd_mod
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import BWD_MODE, PHILOX_OFFSET, PHILOX_SEED, USE_EXP2
+from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd as _bwd_mod
+from aiter.ops.triton._triton_kernels.attention.dao_ai import fwd_prefill as _fwd_mod
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import PHILOX_OFFSET, PHILOX_SEED, USE_EXP2
 from torch.library import custom_op
 
 from .aiter_tuning import install_aiter_tuned_configs
@@ -74,8 +74,13 @@ def bwd_aiter_out(
     dropout_p: float,
 ) -> None:
     # AITER's forward always seeds dropout with the module-level PHILOX_SEED/OFFSET,
-    # so passing the same pair here reproduces the forward mask without threading the
-    # rng_state tensor (and without its .item() host sync) through autograd.
+    # so rebuilding the same rng_state here reproduces the forward mask without
+    # threading the tensor (and its .item() host sync) through autograd.
+    rng_state = None
+    if dropout_p > 0.0:
+        rng_state = torch.empty(2, dtype=torch.int64, device=q.device)
+        rng_state[0].fill_(PHILOX_SEED)
+        rng_state[1].fill_(PHILOX_OFFSET)
     _bwd_mod.attention_backward_triton_impl(
         do=dout,
         q=q,
@@ -96,10 +101,8 @@ def bwd_aiter_out(
         max_seqlen_q=q.shape[1],
         max_seqlen_k=k.shape[1],
         dropout_p=dropout_p,
-        philox_seed=PHILOX_SEED,
-        philox_offset=PHILOX_OFFSET,
+        rng_state=rng_state,
         use_exp2=USE_EXP2,
-        mode=BWD_MODE,
         window_size_left=window_left,
         window_size_right=window_right,
     )

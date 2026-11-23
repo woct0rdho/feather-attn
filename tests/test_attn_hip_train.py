@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as flash_attn_2
 
 from feather_attn import feather_attn_func
 

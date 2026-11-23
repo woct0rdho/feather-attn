@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.bwd import attention_backward_triton_impl
+from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as flash_attn_2
+from aiter.ops.triton._triton_kernels.attention.dao_ai.bwd import attention_backward_triton_impl
 
 from bench.protocol import Case, measure, speedup
 from feather_attn import feather_attn_bwd
@@ -122,10 +122,8 @@ class Provider:
                 max_seqlen_q=seq_len,
                 max_seqlen_k=seq_len,
                 dropout_p=0.0,
-                philox_seed=None,
-                philox_offset=None,
+                rng_state=None,
                 use_exp2=True,
-                mode="fused",
                 window_size_left=-1,
                 window_size_right=-1,
             )

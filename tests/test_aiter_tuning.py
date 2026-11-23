@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, fwd_prefill
+from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, fwd_prefill
 
 from feather_attn import aiter_tuning
 
@@ -27,10 +27,10 @@ def _assert_tuned() -> None:
 
 
 def test_import_installs_aiter_tuned_configs() -> None:
-    """Upstream AITER has no gfx1151 tiles, so importing feather_attn must install them."""
+    """Importing feather_attn must pin the gfx1151 tiles on the AITER autotuners."""
     script = """
 import feather_attn
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import bwd, fwd_prefill
+from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd, fwd_prefill
 from feather_attn import aiter_tuning
 
 sig = lambda cs: [(c.kwargs, c.num_warps, c.num_stages) for c in cs]
