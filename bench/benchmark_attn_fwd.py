@@ -33,7 +33,7 @@ from feather_attn.contract import BENCH_HEAD_COUNTS, BENCH_SEQ_LENS, LAYOUTS, be
 BATCH = 1
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 IMPLS = ("aiter", "feather_fp16_q8", "feather_bf16_d128")
-BF16_CONFIGS = (1, 2)
+BF16_CONFIGS = (5, 6)
 
 
 def build_case(heads, seq_len, head_dim, layout, dtype, impls, configs) -> Case:

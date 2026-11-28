@@ -47,13 +47,22 @@ using ck_tile::index_t;
 // whose double-buffered footprint would exceed the 64 KiB LDS cap.
 // kSwizzled = false uses row-padded, affine LDS addressing. true uses the compact
 // xor-swizzled layout.
-template <bool kHeadFast, index_t kBr, index_t kBc, index_t kBuffersPerTile, bool kSwizzled>
+// kLazy = true keeps the exponential base fixed until a tile's row maximum exceeds it by
+// more than kTheta, so the per-tile rescale, the per-tile normalisation of the probability
+// tile and the online log-sum-exp update all leave the loop. The accumulator holds the
+// unnormalised sum of p*v and is divided once, in the epilogue.
+template <bool kHeadFast, index_t kBr, index_t kBc, index_t kBuffersPerTile, bool kSwizzled, bool kLazy = false>
 struct Bf16FwdD128Kernel
 {
+    // Log2 units of headroom the lazy base keeps above the running row maximum. The
+    // probabilities of a tile therefore reach at most 2^kTheta, which bf16 and the fp32
+    // accumulator both carry without a relative-precision change.
+    static constexpr float kTheta = 8.0f;
     static constexpr index_t kD         = 128;
     static constexpr index_t kBlockM    = kBr;
     static constexpr index_t kBlockN    = kBc;
     static constexpr index_t kWaves     = kBr / 16;
+    static constexpr int kMinBlockPerCu = static_cast<int>(kWaves);
     static constexpr index_t kBlockSize = kWaves * 32;
     static constexpr index_t kLaneRows  = 16;
     static constexpr index_t kDTiles    = kD / 16;
@@ -139,6 +148,10 @@ struct Bf16FwdD128Kernel
 
         CVecType output[kDTiles] = {};
         OnlineLse lse;
+        // The lazy-base state: the running exponential base and the running row sum, both per
+        // lane, both in the `q_row` ownership the rescale fan-out already uses.
+        float lazy_base = -__builtin_inff();
+        float lazy_sum  = 0.0f;
 
         const index_t k_lane_bytes = lane_row * kKStride * sizeof(bf16_t);
         // In the swizzled layout the second d-chunk of a pair sits one chunk away
@@ -299,60 +312,96 @@ struct Bf16FwdD128Kernel
             });
 
             // online softmax in the log2 domain
-            float row_max = -__builtin_inff();
+            const float scale = kargs.softmax_scale_log2;
+            // Four accumulators instead of one 16-link chain: the row maximum and the row sum
+            // are both serial dependencies that the WMMA schedule cannot hide past a few links.
+            float max_acc[4] = {-__builtin_inff(), -__builtin_inff(), -__builtin_inff(),
+                                -__builtin_inff()};
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::static_for<0, 8, 1>{}([&](auto i) {
-                    row_max = __builtin_fmaxf(row_max, scores[n_tile.value][i.value]);
+                    max_acc[(2 * n_tile.value + i.value / 4) & 3] =
+                        __builtin_fmaxf(max_acc[(2 * n_tile.value + i.value / 4) & 3],
+                                        scores[n_tile.value][i.value]);
                 });
             });
+            float row_max = __builtin_fmaxf(
+                __builtin_fmaxf(max_acc[0], max_acc[1]),
+                __builtin_fmaxf(max_acc[2], max_acc[3]));
             row_max = __builtin_fmaxf(row_max, SwapLaneGroup(row_max));
 
-            const float scale      = kargs.softmax_scale_log2;
             const float scaled_max = row_max * scale;
-            const float bias       = -scaled_max;
 
-            float local_sum = 0.0f;
+            // Both paths produce the same three things for this tile: the exponent bias the
+            // probability tile is computed against, a factor that rescales the accumulator
+            // that is already there, and a factor applied to the probability tile itself.
+            float bias    = -scaled_max;
+            float rescale = 1.0f;
+            float p_scale = 1.0f;
+            if constexpr(kLazy)
+            {
+                const float target = __builtin_fmaxf(lazy_base, scaled_max - kTheta);
+                rescale            = Exp2(lazy_base - target);
+                bias               = -target;
+                // The rescale fans a per-row factor out with `readlane`, so it must run
+                // wave-uniformly: one row growing past its base makes every row rescale, and
+                // the rows that did not grow pass a factor of exactly 1.
+                if(__any_sync(0xffffffffffffffffull, target > lazy_base))
+                    RescaleOutput<kDTiles>(output, rescale, lane_group);
+                lazy_base = target;
+            }
+
+            float sum_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::static_for<0, 8, 1>{}([&](auto i) {
                     const float p = Exp2(__builtin_fmaf(
                         scores[n_tile.value][i.value], scale, bias));
                     scores[n_tile.value][i.value] = p;
-                    local_sum += p;
+                    sum_acc[(2 * n_tile.value + i.value / 4) & 3] += p;
                 });
             });
+            float local_sum = (sum_acc[0] + sum_acc[1]) + (sum_acc[2] + sum_acc[3]);
 
             if(tail_tile)
             {
                 // Out-of-range K and V rows are zeroed while staging, so their
-                // scores are exactly 0 and their probability is exp2(-scaled_max).
+                // scores are exactly 0 and their probability is exp2(bias).
                 index_t invalid = 0;
                 ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                     const index_t remaining =
                         kargs.n_kv - key_start - n_tile.value * 16 - 8 * lane_group;
                     invalid += remaining >= 8 ? 0 : (remaining > 0 ? 8 - remaining : 8);
                 });
-                local_sum -= static_cast<float>(invalid) * Exp2(-scaled_max);
+                local_sum -= static_cast<float>(invalid) * Exp2(bias);
             }
 
             const float tile_sum = local_sum + SwapLaneGroup(local_sum);
-            float alpha = 0.0f;
-            float beta  = 0.0f;
-            lse.Update(scaled_max, tile_sum, alpha, beta);
-            // The probability tile is rounded to bf16 by truncation, whose mean error is
-            // half an ulp. Folding (1 + 2^-9) into beta cancels it to first order.
-            beta *= 1.001953125f;
+            if constexpr(kLazy)
+            {
+                lazy_sum = lazy_sum * rescale + tile_sum;
+            }
+            else
+            {
+                float alpha = 0.0f;
+                float beta  = 0.0f;
+                lse.Update(scaled_max, tile_sum, alpha, beta);
+                // The probability tile is rounded to bf16 by truncation, whose mean error is
+                // half an ulp. Folding (1 + 2^-9) into beta cancels it to first order. The lazy
+                // path needs no correction: the same relative error sits in the numerator and
+                // the denominator of the final division, so it cancels there instead.
+                p_scale = beta * 1.001953125f;
+                RescaleOutput<kDTiles>(output, alpha, lane_group);
+            }
 
-            RescaleOutput<kDTiles>(output, alpha, lane_group);
-
-            // P scaled by beta, then transposed into A-fragment layout.
+            // P scaled into the A-fragment layout. `p_scale` is 1 on the lazy path, so the
+            // multiply folds away.
             AVecType p_frag[kNTiles];
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::uint32x8_t words;
                 uint32_t own[4];
                 ck_tile::static_for<0, 4, 1>{}([&](auto k) {
                     own[k.value] = PackBf16Pair(
-                        scores[n_tile.value][2 * k.value] * beta,
-                        scores[n_tile.value][2 * k.value + 1] * beta);
+                        scores[n_tile.value][2 * k.value] * p_scale,
+                        scores[n_tile.value][2 * k.value + 1] * p_scale);
                 });
                 ck_tile::static_for<0, 4, 1>{}([&](auto k) {
                     const uint32_t partner = SwapLaneGroupBits(own[k.value]);
@@ -433,6 +482,23 @@ struct Bf16FwdD128Kernel
 
         // epilogue
         const index_t out_row = q_start + wave * kLaneRows + lane_group;
+
+        // The lazy path holds the unnormalised sum of p*v, so the division by the row sum
+        // happens here, once, with the same per-row lane fan-out the in-loop rescale uses.
+        if constexpr(kLazy)
+        {
+            const int inv_bits = ck_tile::bit_cast<int>(__builtin_amdgcn_rcpf(lazy_sum));
+            ck_tile::static_for<0, 8, 1>{}([&](auto i) {
+                const int even_inv = __builtin_amdgcn_readlane(inv_bits, i.value * 2);
+                const int odd_inv  = __builtin_amdgcn_readlane(inv_bits, i.value * 2 + 1);
+                const float row_inv =
+                    ck_tile::bit_cast<float>(lane_group == 0 ? even_inv : odd_inv);
+                ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
+                    output[d_tile.value][i.value] *= row_inv;
+                });
+            });
+        }
+
         ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
             ck_tile::static_for<0, 8, 1>{}([&](auto i) {
                 const index_t row = out_row + i.value * 2;
@@ -459,17 +525,22 @@ struct Bf16FwdD128Kernel
                     reinterpret_cast<float*>(const_cast<void*>(kargs.lse.ptr));
                 const int32_t lse_head_base =
                     at.batch * kargs.lse.batch_stride + at.head * kargs.lse.head_stride;
+                // `__builtin_amdgcn_logf` is log2 on this target, so the lazy path adds the
+                // running base in the log2 domain and converts once, exactly like OnlineLse.
+                const float lse_bits = kLazy ? (lazy_base + __builtin_amdgcn_logf(lazy_sum))
+                                             : lse.value;
                 lse_ptr[lse_head_base +
-                        static_cast<int32_t>(row) * kargs.lse.row_stride] = lse.Nat();
+                        static_cast<int32_t>(row) * kargs.lse.row_stride] =
+                    lse_bits * 0.6931471805599453f;
             }
         }
     }
 };
 
-template <bool kHeadFast, index_t kBr, index_t kBc, index_t kBuffers, bool kSwizzled>
+template <bool kHeadFast, index_t kBr, index_t kBc, index_t kBuffers, bool kSwizzled, bool kLazy = false>
 bool LaunchBf16FwdD128(const AttentionFwdParams& params)
 {
-    return LaunchAttentionFwd<Bf16FwdD128Kernel<kHeadFast, kBr, kBc, kBuffers, kSwizzled>>(params);
+    return LaunchAttentionFwd<Bf16FwdD128Kernel<kHeadFast, kBr, kBc, kBuffers, kSwizzled, kLazy>>(params);
 }
 
 } // namespace feather_attn

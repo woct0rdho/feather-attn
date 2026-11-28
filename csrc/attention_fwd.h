@@ -24,7 +24,7 @@ using ck_tile::index_t;
 template <typename Kernel>
 bool LaunchAttentionFwd(const AttentionFwdParams& params)
 {
-    const auto kernel = ck_tile::make_kernel<Kernel::kWaves, ck_tile::gfx115_t>(
+    const auto kernel = ck_tile::make_kernel<Kernel::kMinBlockPerCu, ck_tile::gfx115_t>(
         Kernel{}, dim3(params.grid_size), dim3(Kernel::kBlockSize), 0,
         detail::MakeAttentionFwdArgs(params));
     (void)hipGetLastError();

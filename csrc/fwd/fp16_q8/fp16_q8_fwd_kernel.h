@@ -116,6 +116,7 @@ struct Fp16Q8FwdKernel
 
     static constexpr index_t kBlockSize  = Q8Ops::kNumWaves * 32;
     static constexpr index_t kWaves      = Q8Ops::kNumWaves;
+    static constexpr int kMinBlockPerCu  = static_cast<int>(kWaves);
     static constexpr index_t kBlockM     = 128;
     static constexpr index_t kBlockN     = 64;
     static constexpr index_t kHeadDim    = kHeadDimValue;

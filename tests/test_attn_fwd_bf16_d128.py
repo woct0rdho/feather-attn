@@ -25,9 +25,9 @@ REL_L2 = 1.0e-2
 # The log-sum-exp is an fp32 online recurrence over the whole key range: measured 5.3e-6
 # against fp64 at 4096 keys, so the gate carries an order of magnitude of headroom.
 LSE_ATOL = 5.0e-5
-CONFIGS = (0, 1, 2, 3, 4)
+CONFIGS = (0, 1, 2, 3, 4, 5, 6)
 # Config 0 is the heuristic, which resolves to a different tile per layout on purpose.
-PINNED_CONFIGS = (1, 2, 3, 4)
+PINNED_CONFIGS = (1, 2, 3, 4, 5, 6)
 
 CASES = tuple(pytest.param(layout, *shape, id=f"{layout}-B{shape[0]}H{shape[1]}NQ{shape[2]}NKV{shape[3]}") for layout in LAYOUTS for shape in contract_shapes(HEAD_DIM))
 SMALL_CASES = tuple(

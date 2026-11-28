@@ -35,5 +35,9 @@ extern "C" bool feather_attn_fwd_bf16_d128_hnd_br256_bc64_pad_buf1(const Attenti
 extern "C" bool feather_attn_fwd_bf16_d128_nhd_br256_bc64_pad_buf1(const AttentionFwdParams&);
 extern "C" bool feather_attn_fwd_bf16_d128_hnd_br128_bc32_pad(const AttentionFwdParams&);
 extern "C" bool feather_attn_fwd_bf16_d128_nhd_br128_bc32_pad(const AttentionFwdParams&);
+extern "C" bool feather_attn_fwd_bf16_d128_hnd_br256_bc64_swz_lazy(const AttentionFwdParams&);
+extern "C" bool feather_attn_fwd_bf16_d128_nhd_br256_bc64_swz_lazy(const AttentionFwdParams&);
+extern "C" bool feather_attn_fwd_bf16_d128_hnd_br256_bc32_pad_lazy(const AttentionFwdParams&);
+extern "C" bool feather_attn_fwd_bf16_d128_nhd_br256_bc32_pad_lazy(const AttentionFwdParams&);
 
 } // namespace feather_attn

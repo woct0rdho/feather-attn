@@ -36,6 +36,8 @@ constexpr TileConfig kTileConfigs[] = {
     {2, 256, true},  // 256x32 keys, double buffered, row-padded LDS
     {3, 256, false}, // 256x64 keys, single buffer, row-padded LDS
     {4, 128, false}, // 128x32 keys, double buffered, row-padded LDS
+    {5, 256, false}, // 1 with a lazy exponential base
+    {6, 256, true},  // 2 with a lazy exponential base
 };
 
 const TileConfig* FindTileConfig(int64_t id, bool head_fast)
@@ -58,6 +60,10 @@ AttentionFwdLauncher SelectBf16D128Image(bool head_fast, int64_t config)
                              : feather_attn_fwd_bf16_d128_hnd_br256_bc64_pad_buf1;
     case 4: return head_fast ? feather_attn_fwd_bf16_d128_nhd_br128_bc32_pad
                              : feather_attn_fwd_bf16_d128_hnd_br128_bc32_pad;
+    case 5: return head_fast ? feather_attn_fwd_bf16_d128_nhd_br256_bc64_swz_lazy
+                             : feather_attn_fwd_bf16_d128_hnd_br256_bc64_swz_lazy;
+    case 6: return head_fast ? feather_attn_fwd_bf16_d128_nhd_br256_bc32_pad_lazy
+                             : feather_attn_fwd_bf16_d128_hnd_br256_bc32_pad_lazy;
     default: return nullptr;
     }
 }
@@ -67,7 +73,9 @@ AttentionFwdLauncher SelectBf16D128Image(bool head_fast, int64_t config)
 // throughput matrix settled on (see docs/feather_attn_gfx1151_fwd_bf16_d128_plan.md).
 int64_t DefaultBf16D128Config(bool head_fast)
 {
-    return head_fast ? 2 : 1;
+    // The lazy-base images of the same two geometries: measured +2.4% head-major and +3.8%
+    // token-major against the non-lazy ones, on the row set of docs/input_shapes_attn.md.
+    return head_fast ? 6 : 5;
 }
 
 bool LaunchBf16D128(const AttentionFwdView& view, float softmax_scale_log2, int64_t config,
@@ -106,7 +114,7 @@ void AttnBf16D128Feather(const torch::stable::Tensor& q,
     const float scale_log2 = static_cast<float>(softmax_scale * 1.4426950408889634);
 
     const int64_t resolved = config == 0 ? DefaultBf16D128Config(view.nhd) : config;
-    STD_TORCH_CHECK(resolved >= 1 && resolved <= 4, "config must be 0..4");
+    STD_TORCH_CHECK(resolved >= 1 && resolved <= 6, "config must be 0..6");
 
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     void* raw_stream = nullptr;
