@@ -27,13 +27,12 @@ from bench.providers_attn import (
     add_aiter_fwd_providers,
     add_bf16_d128_providers,
     add_fp16_q8_providers,
-    add_vendored_fwd_providers,
 )
 from feather_attn.contract import BENCH_HEAD_COUNTS, BENCH_SEQ_LENS, LAYOUTS, bench_shapes, flops_fwd
 
 BATCH = 1
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
-IMPLS = ("aiter", "vendored", "feather_fp16_q8", "feather_bf16_d128")
+IMPLS = ("aiter", "feather_fp16_q8", "feather_bf16_d128")
 BF16_CONFIGS = (1, 2)
 
 
@@ -45,8 +44,6 @@ def build_case(heads, seq_len, head_dim, layout, dtype, impls, configs) -> Case:
     providers: dict = {}
     if "aiter" in impls:
         add_aiter_fwd_providers(providers, q, k, v, layout)
-    if "vendored" in impls:
-        add_vendored_fwd_providers(providers, q, k, v, layout)
     if "feather_fp16_q8" in impls:
         add_fp16_q8_providers(providers, q, k, v, layout)
     if "feather_bf16_d128" in impls:

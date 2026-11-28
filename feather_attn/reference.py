@@ -1,4 +1,4 @@
-"""The AITER control and the softmax scale, for the benchmarks and the tests.
+"""The AITER control and the softmax scale, for the benchmarks, the tests, and the fallback.
 
 The one place in this repo that calls `interface_v2.fwd`, so the argument order and the
 defaults cannot drift between a benchmark and a test. The control takes and returns the

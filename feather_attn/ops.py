@@ -2,7 +2,6 @@ import torch
 from torch.library import custom_op
 
 from .aiter_kernels import bwd_aiter_out, fwd_aiter_out
-from .aiter_vendored import fwd_out
 from .layout import pack_hnd
 
 
@@ -164,6 +163,41 @@ def _supports_feather_bwd(
     )
 
 
+def _can_use_feather_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    alibi_slopes: torch.Tensor | None,
+    return_attn_probs: bool,
+) -> bool:
+    """Whether the bf16 D128 kernel can serve this call as it stands.
+
+    Dense, non-causal, bf16, head_dim 128, and one head per key head: the kernel computes
+    every query head against the key head of the same index, so GQA stays on AITER. It also
+    wants the compact BSHD operand the operator validates, so a strided view of some larger
+    tensor stays on AITER as well, as does `return_attn_probs`, whose buffer only that path
+    produces.
+    """
+    return (
+        dropout_p == 0.0
+        and not causal
+        and not return_attn_probs
+        and tuple(window_size) == (-1, -1)
+        and alibi_slopes is None
+        and q.dtype == torch.bfloat16
+        and q.dtype == k.dtype == v.dtype
+        and q.shape[-1] == 128
+        and q.shape[2] == k.shape[2]
+        and _batch_and_head_dim_match(q, k, v)
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+    )
+
+
 def _batch_and_head_dim_match(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     return q.shape[0] == k.shape[0] == v.shape[0] and q.shape[-1] == k.shape[-1] == v.shape[-1]
 
@@ -244,8 +278,15 @@ class _FeatherAttnFunc(torch.autograd.Function):
         batch, seqlen_q, nheads_q, _ = q.shape
         out = torch.empty_like(q)
         softmax_lse = torch.empty((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
-        needs_scores = return_attn_probs or dropout_p > 0.0
-        if needs_scores or causal or alibi_slopes is not None or window_size != (-1, -1):
+        # `out` and `softmax_lse` are allocated here, outside the operator boundary, so the
+        # compiler owns the buffers and can fold them into its own allocation plan.
+        if _can_use_feather_fwd(q, k, v, dropout_p, causal, window_size, alibi_slopes, return_attn_probs):
+            sd_mask = None
+            torch.ops.feather_attn.attn_fwd_bf16_d128_feather.default(q, k, v, out, softmax_lse, 1, softmax_scale, 0)
+        else:
+            # AITER's Triton launcher is the fallback: GQA, fp16, D64, causal, dropout,
+            # window, alibi, and any strided operand the native kernel cannot take.
+            needs_scores = return_attn_probs or dropout_p > 0.0
             sd_mask = torch.zeros((batch, nheads_q, seqlen_q, k.shape[1]), device=q.device, dtype=torch.float32) if needs_scores else None
             fwd_aiter_out(
                 q,
@@ -262,9 +303,6 @@ class _FeatherAttnFunc(torch.autograd.Function):
                 dropout_p,
                 return_attn_probs,
             )
-        else:
-            sd_mask = None
-            fwd_out(q, k, v, out, softmax_lse, softmax_scale)
 
         use_feather_bwd = is_grad and _can_use_feather_bwd(q, k, v, dropout_p, causal, window_size, alibi_slopes)
         if use_feather_bwd:
@@ -330,9 +368,10 @@ def feather_attn_func(
 ):
     """FlashAttention 2-compatible dense attention with FeatherAttn backward.
 
-    Q/K/V use FlashAttention's BSHD logical layout. The forward keeps GQA natively
-    (k/v may have fewer heads), the backward expands k/v for the FeatherAttn kernels
-    when the requested features are supported and otherwise falls back to AITER.
+    Q/K/V use FlashAttention's BSHD logical layout. Both directions run the native FeatherAttn
+    kernels for the dense non-causal bf16 D128 case they were built for and delegate to
+    AITER's Triton kernels for everything else: GQA with more query heads than key heads, fp16,
+    D64, causal or windowed masking, dropout, alibi, softcap-free only, and strided operands.
     """
     if softcap != 0.0:
         raise NotImplementedError("softcap is not supported")

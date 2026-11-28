@@ -37,6 +37,7 @@ struct AttentionFwdView
     AttentionOperand k;
     AttentionOperand v;
     AttentionOperand o;
+    AttentionOperand lse;
     int64_t batch;
     int64_t heads;
     int64_t n_q;
@@ -48,11 +49,15 @@ struct AttentionFwdView
 // `nhd` says whether the two middle axes are stored [N, H] (true) or [H, N] (false). It is
 // the only information the tensors themselves cannot express, because both orders put the
 // head dimension innermost.
+//
+// `lse` is optional: nullptr skips the log-sum-exp store. When given it must be a contiguous
+// float32 `[B, H, N]` tensor, the layout both backward kernels read.
 inline AttentionFwdView ValidateAttentionFwd(
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k,
     const torch::stable::Tensor& v,
     const torch::stable::Tensor& o,
+    torch::stable::Tensor* lse,
     bool nhd,
     torch::stable::ScalarType dtype,
     int64_t head_dim_min,
@@ -112,10 +117,28 @@ inline AttentionFwdView ValidateAttentionFwd(
                                 static_cast<int32_t>(t.stride(head_axis)),
                                 static_cast<int32_t>(t.stride(0))};
     };
+    AttentionOperand lse_operand{nullptr, 0, 0, 0};
+    if(lse != nullptr)
+    {
+        STD_TORCH_CHECK(lse->is_cuda() && lse->get_device_index() == device_index,
+                        "lse must be a CUDA tensor on q's device");
+        STD_TORCH_CHECK(lse->scalar_type() == torch::stable::ScalarType::Float,
+                        "lse must be float32");
+        STD_TORCH_CHECK(lse->dim() == 3 && lse->size(0) == batch &&
+                            lse->size(1) == heads && lse->size(2) == n_q,
+                        "lse must be [batch, heads, N_Q]");
+        STD_TORCH_CHECK(IsContiguousND(*lse, 3) && IsInt32Addressable(*lse, sizeof(float)),
+                        "lse must be contiguous and within the signed-int32 byte-offset contract");
+        lse_operand = AttentionOperand{lse->mutable_data_ptr(),
+                                       static_cast<int32_t>(lse->stride(2)),
+                                       static_cast<int32_t>(lse->stride(1)),
+                                       static_cast<int32_t>(lse->stride(0))};
+    }
     return AttentionFwdView{operand(q.const_data_ptr(), q),
                             operand(k.const_data_ptr(), k),
                             operand(v.const_data_ptr(), v),
                             operand(o.mutable_data_ptr(), o),
+                            lse_operand,
                             batch,
                             heads,
                             n_q,
@@ -177,6 +200,7 @@ inline AttentionFwdParams MakeAttentionFwdParams(const AttentionFwdView& view,
                               view.k,
                               view.v,
                               view.o,
+                              view.lse,
                               softmax_scale_log2,
                               static_cast<int32_t>(view.n_q),
                               static_cast<int32_t>(view.n_kv),

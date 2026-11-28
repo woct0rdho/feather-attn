@@ -115,8 +115,9 @@ void AttnFp16Q8Feather(const torch::stable::Tensor& q,
                     "layout must be 0 (HND) or 1 (NHD)");
     STD_TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0.0,
                     "softmax_scale must be finite and positive");
+    // This family has no log-sum-exp output. The shared ABI carries a null operand.
     const AttentionFwdView view = ValidateAttentionFwd(
-        q, k, v, o, IsNhdLayout(layout), torch::stable::ScalarType::Half, 64, 128);
+        q, k, v, o, nullptr, IsNhdLayout(layout), torch::stable::ScalarType::Half, 64, 128);
     const float scale_log2 = static_cast<float>(softmax_scale * 1.4426950408889634);
 
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());

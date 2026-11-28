@@ -92,6 +92,7 @@ void AttnBf16D128Feather(const torch::stable::Tensor& q,
                          const torch::stable::Tensor& k,
                          const torch::stable::Tensor& v,
                          torch::stable::Tensor& o,
+                         torch::stable::Tensor& lse,
                          int64_t layout,
                          double softmax_scale,
                          int64_t config)
@@ -101,7 +102,7 @@ void AttnBf16D128Feather(const torch::stable::Tensor& q,
     STD_TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0.0,
                     "softmax_scale must be finite and positive");
     const AttentionFwdView view = ValidateAttentionFwd(
-        q, k, v, o, IsNhdLayout(layout), torch::stable::ScalarType::BFloat16, 128, 128);
+        q, k, v, o, &lse, IsNhdLayout(layout), torch::stable::ScalarType::BFloat16, 128, 128);
     const float scale_log2 = static_cast<float>(softmax_scale * 1.4426950408889634);
 
     const int64_t resolved = config == 0 ? DefaultBf16D128Config(view.nhd) : config;
@@ -134,6 +135,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn, m)
         "Tensor k, "
         "Tensor v, "
         "Tensor(a!) out, "
+        "Tensor(b!) lse, "
         "int layout, "
         "float softmax_scale, "
         "int config"

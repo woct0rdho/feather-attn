@@ -16,7 +16,7 @@ A new forward attention kernel for gfx1151 that is faster than AITER's Triton `a
 | Grid policy | head-slow (HND) and head-fast (NHD) specializations |
 | Out of scope | D64, fp8/int8 quantization, masks, causal, GQA, backward, public API dispatch |
 
-The kernel is exposed as one opaque op, `feather_attn::attn_fwd_bf16_d128_feather`, reached from Python by `feather_attn/ops_bf16.py`. It is deliberately not wired into `feather_attn.ops.feather_attn_func`, which keeps the vendored Triton kernel as the public forward.
+The kernel is exposed as one opaque op, `feather_attn::attn_fwd_bf16_d128_feather`, reached from Python by `feather_attn/ops_bf16.py`. It writes the natural-log log-sum-exp as a second output, which is what makes it usable as the forward of `feather_attn.ops.feather_attn_func` for the dense non-causal bf16 D128 case. Every other request is delegated to AITER's Triton launcher. The operator takes `out` and `lse` as arguments rather than allocating them, so under `torch.compile` the allocations stay in the traced graph.
 
 ## Result
 
@@ -47,6 +47,8 @@ Measured with `python -m bench.benchmark_attn_fwd --impls aiter,feather_bf16_d12
 - Geometric mean over the 18 rows: 1.132x against AITER. HND alone 1.135x, NHD alone 1.129x.
 - All 18 rows beat AITER. The weakest is NHD H16 N4096 at 1.011x, which is 512 workgroups over 20 processors and therefore the most tail-quantised cell in the matrix.
 - The same matrix measured 1.142x in an earlier session (raw data `post_refactor.json`), so the absolute TFLOPS and the ratio both move by ~1% between sessions. This machine's sustained clock drifts by more than that. The per-row ordering is stable.
+- The log-sum-exp the operator emits is the natural-log value FlashAttention and the backward kernels use, converted once from the log2 accumulator. Against the definition evaluated in fp64 it measures 5.3e-6 at 4096 keys (`tests/test_attn_fwd_bf16_d128.py::test_bf16_d128_lse_matches_fp64`). Note for anyone touching the recurrence: `__builtin_amdgcn_logf` is the hardware `v_log_f32`, which returns log2 on this target, so the accumulator needs no base conversion inside the loop. Scaling it breaks the value by exactly that factor.
+- Cost of the emitted log-sum-exp: one store per query row per block. H16/N4096/D128 measures 3.957 ms against 3.935 ms without it (`~0.6%`, inside session noise).
 - Accuracy against AITER, gated in `tests/test_attn_fwd_bf16_d128.py`: `atol=rtol=0.02` plus `rel-L2 <= 1e-2`. The measured worst case over the contract is a rel-L2 of 5.0e-3 and an elementwise ratio of 0.26 of the envelope. Against a blocked fp32 reconstruction, rel-L2 is 4.4e-3. Cosine is deliberately not part of any forward gate. It is the backward's primary metric because the optimizer normalizes the gradient magnitude.
 
 ## Why the previous kernel left performance on the table

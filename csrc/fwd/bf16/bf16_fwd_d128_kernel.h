@@ -445,6 +445,24 @@ struct Bf16FwdD128Kernel
                 }
             });
         });
+
+        // The scores are computed as `K @ Q^T`, so a lane owns one query row: the column of
+        // its score fragment is `lane_row`, and the two lane groups hold the same row's log
+        // sum because the row max and row sum are merged across them. One store per lane, from
+        // the low group so the two groups do not write the same address.
+        if(kargs.lse.ptr != nullptr && lane_group == 0)
+        {
+            const index_t row = q_start + q_row;
+            if(row < kargs.n_q)
+            {
+                float* const lse_ptr =
+                    reinterpret_cast<float*>(const_cast<void*>(kargs.lse.ptr));
+                const int32_t lse_head_base =
+                    at.batch * kargs.lse.batch_stride + at.head * kargs.lse.head_stride;
+                lse_ptr[lse_head_base +
+                        static_cast<int32_t>(row) * kargs.lse.row_stride] = lse.Nat();
+            }
+        }
     }
 };
 

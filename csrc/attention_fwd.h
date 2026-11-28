@@ -121,7 +121,15 @@ struct WmmaOps<ck_tile::bf16_t>
 
 // The log-domain online softmax state. `Update` is the whole recurrence: it returns the
 // factor for the persistent accumulator (`alpha`) and the factor for the current probability
-// tile (`beta`), then advances the running log-sum-exp.
+// tile (`beta`), then advances the running log-sum-exp. `value` is the log-sum-exp in the
+// log2 domain the kernel works in. `Nat` converts it to the natural-log value the backward
+// kernels and FlashAttention's `softmax_lse` use.
+//
+// `__builtin_amdgcn_logf` is the hardware `v_log_f32`, which returns log2 on this target -
+// the same base `Exp2`/`__builtin_amdgcn_exp2f` exponentiates in, so the pair is used
+// directly with no base conversion inside the loop. Multiplying by log2(e) here is wrong by
+// exactly that factor. `tests/test_attn_fwd_bf16_d128.py` pins the emitted log-sum-exp
+// against fp64.
 struct OnlineLse
 {
     float value = -__builtin_inff();
@@ -137,6 +145,11 @@ struct OnlineLse
         alpha                = old_term * inv;
         beta                 = new_term * inv;
         value                = merged + __builtin_amdgcn_logf(combined);
+    }
+
+    CK_TILE_DEVICE float Nat() const
+    {
+        return value * 0.6931471805599453f;
     }
 };
 

@@ -1,12 +1,15 @@
+"""The AITER Triton operators, wrapped as opaque ops so `torch.compile` can trace past them.
+
+These are the fallback for every call the native FeatherAttn kernels do not serve: GQA, fp16,
+D64, causal and windowed masking, dropout, and alibi. The wrapper passes the operand buffers
+in, so the caller allocates them and the compiler can see the allocations.
+"""
+
 import torch
 from aiter.ops.triton._triton_kernels.attention.dao_ai import bwd as _bwd_mod
 from aiter.ops.triton._triton_kernels.attention.dao_ai import fwd_prefill as _fwd_mod
 from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import PHILOX_OFFSET, PHILOX_SEED, USE_EXP2
 from torch.library import custom_op
-
-from .aiter_tuning import install_aiter_tuned_configs
-
-install_aiter_tuned_configs()
 
 
 @custom_op("feather_attn::fwd_aiter_out", mutates_args={"out", "softmax_lse", "sd_mask"})

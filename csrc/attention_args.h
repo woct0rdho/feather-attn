@@ -26,13 +26,16 @@ struct AttentionOperand
     int32_t batch_stride;
 };
 
-// What a kernel reads.
+// What a kernel reads. `lse` is written, not read: one natural-log log-sum-exp per query
+// row, which `ptr == nullptr` skips. Its row axis is the sequence axis, so `row_stride` is 1
+// for the contiguous `[B, H, N]` tensor the backward consumes.
 struct AttentionFwdArgs
 {
     AttentionOperand q;
     AttentionOperand k;
     AttentionOperand v;
     AttentionOperand o;
+    AttentionOperand lse;
     float softmax_scale_log2;
     int32_t n_q;
     int32_t n_kv;
@@ -48,6 +51,7 @@ struct AttentionFwdParams
     AttentionOperand k;
     AttentionOperand v;
     AttentionOperand o;
+    AttentionOperand lse;
     float softmax_scale_log2;
     int32_t n_q;
     int32_t n_kv;
@@ -69,6 +73,7 @@ inline AttentionFwdArgs MakeAttentionFwdArgs(const AttentionFwdParams& params)
                             params.k,
                             params.v,
                             params.o,
+                            params.lse,
                             params.softmax_scale_log2,
                             params.n_q,
                             params.n_kv,

@@ -77,22 +77,33 @@ def test_compiled_matches_aiter(label, kwargs) -> None:
         _assert_close(actual, expected)
 
 
-def test_compiled_has_no_graph_breaks_and_hoists_allocations() -> None:
-    q, k, v = _case(1, 256, 256, 8, 128, False, 1)
-
+def _compiled_code(q, k, v) -> str:
     def run(qq, kk, vv):
         return feather_attn_func(qq, kk, vv, softmax_scale=128**-0.5)
 
     explanation = dynamo.explain(run)(q, k, v)
     assert explanation.graph_break_count == 0, explanation.break_reasons
-
     _, code = run_and_get_code(torch.compile(run, fullgraph=True), q, k, v)
-    text = "\n".join(code)
+    return "\n".join(code)
+
+
+def test_compiled_has_no_graph_breaks_and_hoists_allocations() -> None:
+    q, k, v = _case(1, 256, 256, 8, 128, False, 1)
+    text = _compiled_code(q, k, v)
     # out/softmax_lse are allocated by the graph (Inductor buffer), not inside the op
     assert "empty_strided" in text
-    # the vendored forward kernel is codegen'd by Inductor with its autotune config space
-    assert "user_autotune" in text
-    assert "_attn_fwd" in text
+    # the dense bf16 D128 call runs the native kernel, as an opaque op the graph calls
+    assert "attn_fwd_bf16_d128_feather" in text
+    assert "fwd_aiter_out" not in text
+
+
+def test_compiled_falls_back_to_aiter_for_gqa() -> None:
+    """A case the native kernel does not serve must still trace as one graph."""
+    q, k, v = _case(1, 256, 256, 8, 128, False, 4)
+    text = _compiled_code(q, k, v)
+    assert "empty_strided" in text
+    assert "fwd_aiter_out" in text
+    assert "attn_fwd_bf16_d128_feather" not in text
 
 
 def test_dynamic_shapes_share_one_graph() -> None:
