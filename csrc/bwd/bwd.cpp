@@ -1,7 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include "common.h"
-#include "launch_params.h"
+#include "bwd/bwd_params.h"
 
 #ifndef NO_PYTORCH
 #if defined(__clang__)
@@ -37,12 +37,12 @@ void AttnBwdFeatherImpl(
     torch::stable::Tensor& dk,
     torch::stable::Tensor& dv,
     torch::stable::Tensor& delta,
-    double softmax_scale,
     int64_t layout,
+    double softmax_scale,
     torch::stable::Tensor* dq_acc,
     bool fused)
 {
-    STD_TORCH_CHECK(layout == 0 || layout == 1,
+    STD_TORCH_CHECK(layout == kLayoutHnd || layout == kLayoutNhd,
                     "layout must be 0 (HND) or 1 (NHD)");
     STD_TORCH_CHECK(q.is_cuda(), "all backward tensors must be CUDA tensors");
     const auto device_index = q.get_device_index();
@@ -91,7 +91,7 @@ void AttnBwdFeatherImpl(
     CheckAttentionDim(dk);
     CheckAttentionDim(dv);
 
-    const bool nhd = layout == 1;
+    const bool nhd = IsNhdLayout(layout);
     const int64_t head_axis = nhd ? 2 : 1;
     const int64_t seq_axis = nhd ? 1 : 2;
     const int64_t batch = q.size(0);
@@ -246,12 +246,12 @@ void AttnBwdFeather(
     torch::stable::Tensor& dk,
     torch::stable::Tensor& dv,
     torch::stable::Tensor& delta,
-    double softmax_scale,
-    int64_t layout)
+    int64_t layout,
+    double softmax_scale)
 {
     AttnBwdFeatherImpl(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, delta,
-        softmax_scale, layout, nullptr, false);
+        layout, softmax_scale, nullptr, false);
 }
 
 void AttnBwdFeatherFused(
@@ -266,12 +266,12 @@ void AttnBwdFeatherFused(
     torch::stable::Tensor& dv,
     torch::stable::Tensor& delta,
     torch::stable::Tensor& dq_acc,
-    double softmax_scale,
-    int64_t layout)
+    int64_t layout,
+    double softmax_scale)
 {
     AttnBwdFeatherImpl(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, delta,
-        softmax_scale, layout, &dq_acc, true);
+        layout, softmax_scale, &dq_acc, true);
 }
 
 } // namespace feather_attn
@@ -282,13 +282,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn, m)
         "attn_bwd_feather("
         "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, "
         "Tensor softmax_lse, Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, "
-        "Tensor(d!) delta, float softmax_scale, int layout"
+        "Tensor(d!) delta, int layout, float softmax_scale"
         ") -> ()");
     m.def(
         "attn_bwd_feather_fused("
         "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, "
         "Tensor softmax_lse, Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, "
-        "Tensor(d!) delta, Tensor(e!) dq_acc, float softmax_scale, int layout"
+        "Tensor(d!) delta, Tensor(e!) dq_acc, int layout, float softmax_scale"
         ") -> ()");
 }
 

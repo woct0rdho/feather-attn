@@ -9,6 +9,16 @@
 
 namespace feather_attn {
 
+// Physical head/sequence order of every attention operator. The ids are part of the
+// operator schemas, so they must match `feather_attn/layout.py`.
+constexpr int64_t kLayoutHnd = 0;
+constexpr int64_t kLayoutNhd = 1;
+
+inline bool IsNhdLayout(int64_t layout)
+{
+    return layout == kLayoutNhd;
+}
+
 #ifndef NO_PYTORCH
 
 // Stride check for a tensor with exactly `ndim` dimensions. Size-1

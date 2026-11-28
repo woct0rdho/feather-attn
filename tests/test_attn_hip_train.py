@@ -6,31 +6,20 @@ import torch
 from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as flash_attn_2
 
 from feather_attn import feather_attn_func
+from feather_attn.reference import aiter_fwd_bshd
 
 
-def _aiter_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: float,
-    causal: bool,
-    window_size: tuple[int, int],
-    alibi_slopes: torch.Tensor | None,
-):
-    return flash_attn_2.fwd(
+def _aiter_fwd(q, k, v, softmax_scale, causal, window_size, alibi_slopes):
+    out, lse = aiter_fwd_bshd(
         q,
         k,
         v,
-        out=None,
-        alibi_slopes=alibi_slopes,
-        dropout_p=0.0,
-        softmax_scale=softmax_scale,
+        softmax_scale,
         causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
-        softcap=0.0,
-        return_softmax=False,
+        window=window_size,
+        alibi_slopes=alibi_slopes,
     )
+    return out, lse, None, None
 
 
 def _aiter_bwd(

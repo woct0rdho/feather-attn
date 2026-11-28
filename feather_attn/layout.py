@@ -1,4 +1,9 @@
-"""BSHD <-> HND layout conversions for the FeatherAttn backward.
+"""Physical head/sequence order, and the views between BSHD and HND.
+
+`HND = 0` and `NHD = 1` are the `layout` field of every native attention operator, so they
+must not be renumbered.
+
+The `pack_hnd` half is the FeatherAttn backward's layout conversion.
 
 `transpose(1, 2).contiguous()` drops to ~20 GB/s once a Q/K/V sized tensor leaves L2
 on gfx1151 (0.24 ms at 4096 tokens, 3.7 ms at 9216), which is more than the attention
@@ -11,6 +16,20 @@ import torch
 import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
+
+HND = 0
+NHD = 1
+LAYOUT_IDS = {"HND": HND, "NHD": NHD}
+
+
+def to_bshd(tensor: torch.Tensor, layout: str) -> torch.Tensor:
+    """View a tensor stored in `layout` as `[B, N, H, D]`. A transpose, so no copy."""
+    return tensor.transpose(1, 2) if layout == "HND" else tensor
+
+
+def to_hnd(tensor: torch.Tensor, layout: str) -> torch.Tensor:
+    """View a tensor stored in `layout` as `[B, H, N, D]`. A transpose, so no copy."""
+    return tensor if layout == "HND" else tensor.transpose(1, 2)
 
 
 @triton.jit
@@ -62,7 +81,7 @@ def pack_hnd_out(x: torch.Tensor, out: torch.Tensor) -> None:
     )
 
 
-def to_hnd(t: torch.Tensor) -> torch.Tensor:
+def pack_hnd(t: torch.Tensor) -> torch.Tensor:
     """`(B, L, H, D)` -> `(B, H, L, D)` carrying the same data, contiguous in HND."""
     hnd = t.transpose(1, 2)
     if hnd.is_contiguous():

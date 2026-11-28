@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""The backward benchmark, with AITER's Triton backward as the control.
+
+Speed only: accuracy is `pytest tests/`, which is expected to pass before this file says
+anything.
+
+Run it as a module from the repository root, so that the `bench` package is this
+repository's:
+
+    python -m bench.benchmark_attn_hip_bwd --output <path>
+"""
 
 import argparse
 import gc
@@ -9,22 +19,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as flash_attn_2
 from aiter.ops.triton._triton_kernels.attention.dao_ai.bwd import attention_backward_triton_impl
 
 from bench.protocol import Case, measure, speedup
 from feather_attn import feather_attn_bwd
+from feather_attn.contract import BENCH_HEAD_COUNTS, BENCH_SEQ_LENS, LAYOUTS, bench_shapes, flops_bwd
+from feather_attn.layout import to_bshd
+from feather_attn.reference import aiter_fwd_lse
 
 BATCH = 1
 DTYPE = torch.float16
 DTYPE_NAME = "fp16"
 HEAD_DIM = 64
 GEMM_COUNT = 7
-BENCHMARK_HEAD_COUNTS = (16, 32, 56)
-SEQ_LENS = (4096, 8192, 16384)
-BENCHMARK_SHAPES = tuple((heads, seq_len) for heads in BENCHMARK_HEAD_COUNTS for seq_len in SEQ_LENS)
-LAYOUTS = ("HND", "NHD")
-PROVIDERS = ("aiter", "feather")
+BENCHMARK_SHAPES = bench_shapes(BENCH_HEAD_COUNTS, BENCH_SEQ_LENS)
+PROVIDERS = ("aiter", "feather_bwd")
 
 
 @dataclass
@@ -40,10 +49,13 @@ class SavedState:
 
 
 def _bshd(tensor: torch.Tensor, layout: str) -> torch.Tensor:
-    return tensor.transpose(1, 2) if layout == "HND" else tensor
+    """AITER's backward takes BSHD, so an HND call sees a transposed view."""
+    return to_bshd(tensor, layout)
 
 
 def _saved_state(heads: int, seq_len: int, seed: int, layout: str) -> SavedState:
+    """A forward pass to differentiate. The forward is AITER for both providers, so the
+    comparison isolates the backward."""
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     shape = (BATCH, heads, seq_len, HEAD_DIM) if layout == "HND" else (BATCH, seq_len, heads, HEAD_DIM)
@@ -52,26 +64,13 @@ def _saved_state(heads: int, seq_len: int, seed: int, layout: str) -> SavedState
     v = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
     dout = torch.randn(shape, device="cuda", dtype=DTYPE, generator=generator)
     scale = HEAD_DIM**-0.5
-    out_bshd, lse, _, _ = flash_attn_2.fwd(
-        _bshd(q, layout),
-        _bshd(k, layout),
-        _bshd(v, layout),
-        out=None,
-        alibi_slopes=None,
-        dropout_p=0.0,
-        softmax_scale=scale,
-        causal=False,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        return_softmax=False,
-    )
+    out, lse = aiter_fwd_lse(q, k, v, layout, scale)
     return SavedState(
         q=q,
         k=k,
         v=v,
-        out=(out_bshd.transpose(1, 2).contiguous() if layout == "HND" else out_bshd.contiguous()),
-        lse=lse.contiguous(),
+        out=out.contiguous(),
+        lse=lse,
         dout=dout,
         scale=scale,
         layout=layout,
@@ -89,7 +88,7 @@ class Provider:
 
     def launch(self) -> None:
         x = self.state
-        if self.name == "feather":
+        if self.name == "feather_bwd":
             feather_attn_bwd(
                 x.dout,
                 x.q,
@@ -158,7 +157,7 @@ def _run_shape(
     case = Case(f"H={heads} N={seq_len} D={HEAD_DIM} {layout}", {name: provider.launch for name, provider in providers.items()})
     measurements = measure(case.providers, warmup=warmups, rounds=repeats)
     flops_f7 = 14.0 * BATCH * heads * seq_len * seq_len * HEAD_DIM
-    flops_pipeline = 2.0 * GEMM_COUNT * BATCH * heads * seq_len * seq_len * HEAD_DIM
+    flops_pipeline = flops_bwd(BATCH, heads, seq_len, seq_len, HEAD_DIM, GEMM_COUNT)
     return {
         "shape": {
             "batch": BATCH,
@@ -170,9 +169,9 @@ def _run_shape(
         },
         "seed": seed,
         "timings": _timing(measurements, flops_f7, flops_pipeline),
-        "feather_over_aiter": speedup(measurements["feather"], measurements["aiter"]),
-        "paired_ratio_p20": measurements["aiter"].p20_ms / measurements["feather"].p80_ms,
-        "paired_ratio_p80": measurements["aiter"].p80_ms / measurements["feather"].p20_ms,
+        "feather_bwd_over_aiter": speedup(measurements["feather_bwd"], measurements["aiter"]),
+        "paired_ratio_p20": measurements["aiter"].p20_ms / measurements["feather_bwd"].p80_ms,
+        "paired_ratio_p80": measurements["aiter"].p80_ms / measurements["feather_bwd"].p20_ms,
     }
 
 
@@ -201,7 +200,7 @@ def _parse_layouts(value: str) -> list[str]:
 def _speedups(rows: list[dict[str, object]]) -> list[float]:
     ratios = []
     for row in rows:
-        ratio = row["feather_over_aiter"]
+        ratio = row["feather_bwd_over_aiter"]
         if not isinstance(ratio, float):
             raise TypeError("benchmark speedup must be a float")
         ratios.append(ratio)
@@ -221,8 +220,8 @@ def _write_result(
             "batch": BATCH,
             "head_dim": HEAD_DIM,
             "dtype": DTYPE_NAME,
-            "head_counts": list(BENCHMARK_HEAD_COUNTS),
-            "seq_lens": list(SEQ_LENS),
+            "head_counts": list(BENCH_HEAD_COUNTS),
+            "seq_lens": list(BENCH_SEQ_LENS),
             "layouts": list(LAYOUTS),
             "flops_f7": "14 * B * H * N^2 * D",
             "flops_pipeline": f"2 * {GEMM_COUNT} * B * H * N^2 * D",
@@ -234,8 +233,8 @@ def _write_result(
             "outputs_preallocated": True,
         },
         "rows": rows,
-        "geometric_mean_feather_over_aiter": math.exp(statistics.fmean(math.log(ratio) for ratio in ratios)),
-        "feather_wins": sum(ratio > 1.0 for ratio in ratios),
+        "geometric_mean_feather_bwd_over_aiter": math.exp(statistics.fmean(math.log(ratio) for ratio in ratios)),
+        "feather_bwd_wins": sum(ratio > 1.0 for ratio in ratios),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2) + "\n")

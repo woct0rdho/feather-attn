@@ -1,5 +1,20 @@
 # FeatherAttn gfx1151 Forward Kernel
 
+Code map update. This document is the historical campaign record. The kernel it describes is now the `fp16_q8` family and lives at:
+
+| This document | Current location |
+| --- | --- |
+| `csrc/fwd/fwd_fp8_kernel.h`, `AttentionKernel` | `csrc/fwd/fp16_q8/fp16_q8_fwd_kernel.h`, `Fp16Q8FwdKernel` |
+| `csrc/fwd/fwd_fp8_{aligned,query_tail,key_tail,query_key_tail}.cu` | `csrc/fwd/fp16_q8/fp16_q8_fwd_*.cu` |
+| `csrc/fwd/fwd_fp8.cpp`, op `attn_fp16_feather` | `csrc/fwd/fp16_q8/fp16_q8_fwd.cpp`, op `attn_fwd_fp16_q8_feather` |
+| `feather_attn.ops.feather_attn` | `feather_attn.ops_fp16_q8.feather_attn_fp16_q8` |
+| `tests/test_attn_hip.py` | `tests/test_attn_fwd_fp16_q8.py` |
+| `bench/benchmark_attn_hip.py` | `python -m bench.benchmark_attn_fwd --impls aiter,feather_fp16_q8 --dtypes fp16` |
+
+Two structural changes landed with that move: `LaunchParams`/`StridedLaunchParams` became the shared `AttentionFwdParams` (per-operand strides plus `head_start`/`head_step`/ `launch_heads`), and the four `nhd_d64_strided_*` images were folded into the four `nhd_d64_*` images because the strided head mapping is now just `head_step = group_count`.  The family is 16 images, not 20, and the `FEATHER_ATTN_STRIDED_NHD` class-rename macro is gone. `softmax_scale` is also an operator argument now instead of a folded constant.
+
+Current status on this machine: the family measures 0.94-0.98x of AITER on the HND rows and 0.79-0.86x on the NHD D128 rows, i.e. the D128 figures in the tables below still do not reproduce (see `~/tmp/feather_attn/q16_analysis/REPORT.md` for why: the recorded images came from an LLVM 23 snapshot that is no longer installable, and today's toolchain spills at D128). The bf16 family in `docs/feather_attn_gfx1151_fwd_bf16_d128_plan.md` is the one that beats AITER, at 1.14x geomean.
+
 ## Hardware and Execution Assumptions
 
 | Item | Value |

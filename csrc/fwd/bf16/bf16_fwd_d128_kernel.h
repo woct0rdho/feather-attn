@@ -35,19 +35,12 @@
 #include <ck_tile/core.hpp>
 #include <ck_tile/host/kernel_launch.hpp>
 
-#include "fwd/bf16/bf16_fwd_params.h"
+#include "attention_fwd.h"
 
 namespace feather_attn {
 
 using ck_tile::bf16_t;
 using ck_tile::index_t;
-
-struct Bf16Wmma
-{
-    using AVecType = ck_tile::bf16x16_t;
-    using BVecType = ck_tile::bf16x16_t;
-    using CVecType = ck_tile::fp32x8_t;
-};
 
 // kBuffersPerTile = 2 publishes both K and V one tile ahead (one barrier per KV
 // tile). = 1 reuses a single K and V buffer (two barriers) for the configurations
@@ -84,61 +77,17 @@ struct Bf16FwdD128Kernel
     static_assert(kKeysPerWave % 2 == 0 && kVRowsPerLane >= 1 && kVRowsPerLane <= 4);
     static_assert(kLdsBytes <= 65536, "per-workgroup LDS limit");
 
-    using Wmma = Bf16Wmma;
+    using Wmma = WmmaOps<ck_tile::bf16_t>;
+    using CVecType = typename Wmma::CVecType;
+    using AVecType = typename Wmma::AVecType;
+    using BVecType = typename Wmma::BVecType;
 
-    struct Kargs
-    {
-        Bf16Operand q;
-        Bf16Operand k;
-        Bf16Operand v;
-        Bf16Operand o;
-        float softmax_scale_log2;
-        int32_t n_q;
-        int32_t n_kv;
-        int32_t head_start;
-        int32_t launch_heads;
-    };
-
-    CK_TILE_DEVICE static void WmmaInit(
-        typename Wmma::CVecType& c,
-        const typename Wmma::AVecType& a,
-        const typename Wmma::BVecType& b)
-    {
-        asm volatile("v_wmma_f32_16x16x16_bf16 %0, %1, %2, 0" : "=v"(c) : "v"(a), "v"(b));
-    }
-
-    CK_TILE_DEVICE static void WmmaInPlace(
-        typename Wmma::CVecType& c,
-        const typename Wmma::AVecType& a,
-        const typename Wmma::BVecType& b)
-    {
-        asm volatile("v_wmma_f32_16x16x16_bf16 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
-    }
-
-    CK_TILE_DEVICE static float Exp2(float value)
-    {
-        return __builtin_amdgcn_exp2f(value);
-    }
-
-    // bf16 pair with the mantissa truncated. The (1 + 2^-9) folded into beta makes
-    // the truncation unbiased to first order.
+    // bf16 pair with the mantissa truncated. The (1 + 2^-9) folded into beta makes the
+    // truncation unbiased to first order, which is why no rounding step is needed.
     CK_TILE_DEVICE static uint32_t PackBf16Pair(float lo, float hi)
     {
         return ck_tile::bit_cast<uint32_t>(lo) >> 16 |
                (ck_tile::bit_cast<uint32_t>(hi) & 0xffff0000u);
-    }
-
-    CK_TILE_DEVICE static float SwapLaneGroup(float value)
-    {
-        const uint32_t bits = ck_tile::bit_cast<uint32_t>(value);
-        return ck_tile::bit_cast<float>(
-            __builtin_amdgcn_permlanex16(0u, bits, 0x76543210u, 0xfedcba98u, false, true));
-    }
-
-    CK_TILE_DEVICE static uint32_t SwapLaneGroupBits(uint32_t bits)
-    {
-        return __builtin_amdgcn_permlanex16(
-            0u, bits, 0x76543210u, 0xfedcba98u, false, true);
     }
 
     CK_TILE_DEVICE static index_t VPhase(index_t d)
@@ -146,7 +95,7 @@ struct Bf16FwdD128Kernel
         return (d ^ (d / kKPack)) % (kBc / kKPack);
     }
 
-    CK_TILE_DEVICE void operator()(Kargs kargs) const
+    CK_TILE_DEVICE void operator()(AttentionFwdArgs kargs) const
     {
         alignas(16) __shared__ uint8_t lds[kLdsBytes];
 
@@ -159,39 +108,22 @@ struct Bf16FwdD128Kernel
 
         const index_t q_tiles = (kargs.n_q + kBlockM - 1) / kBlockM;
         const index_t block   = ck_tile::get_block_1d_id();
-        index_t q_tile;
-        index_t head;
-        index_t batch;
-        if constexpr(kHeadFast)
-        {
-            head    = block % kargs.launch_heads + kargs.head_start;
-            const index_t tile_batch = block / kargs.launch_heads;
-            q_tile  = tile_batch % q_tiles;
-            batch   = tile_batch / q_tiles;
-        }
-        else
-        {
-            q_tile = block % q_tiles;
-            const index_t linear = block / q_tiles;
-            head  = linear % kargs.launch_heads + kargs.head_start;
-            batch = linear / kargs.launch_heads;
-        }
-        const index_t q_start = q_tile * kBlockM;
-
-        const int32_t q_head_base =
-            batch * kargs.q.batch_stride + head * kargs.q.head_stride;
-        const int32_t k_head_base =
-            batch * kargs.k.batch_stride + head * kargs.k.head_stride;
-        const int32_t v_head_base =
-            batch * kargs.v.batch_stride + head * kargs.v.head_stride;
-        const int32_t o_head_base =
-            batch * kargs.o.batch_stride + head * kargs.o.head_stride;
+        const AttentionBlockIndex at = DecodeAttentionBlock<kHeadFast>(block, q_tiles, kargs);
+        const index_t q_start = at.q_tile * kBlockM;
 
         const bf16_t* const q_ptr = reinterpret_cast<const bf16_t*>(kargs.q.ptr);
         const bf16_t* const k_ptr = reinterpret_cast<const bf16_t*>(kargs.k.ptr);
         const bf16_t* const v_ptr = reinterpret_cast<const bf16_t*>(kargs.v.ptr);
-        bf16_t* const o_ptr =
-            reinterpret_cast<bf16_t*>(const_cast<void*>(kargs.o.ptr));
+        bf16_t* const o_ptr = reinterpret_cast<bf16_t*>(const_cast<void*>(kargs.o.ptr));
+
+        const int32_t q_head_base =
+            at.batch * kargs.q.batch_stride + at.head * kargs.q.head_stride;
+        const int32_t k_head_base =
+            at.batch * kargs.k.batch_stride + at.head * kargs.k.head_stride;
+        const int32_t v_head_base =
+            at.batch * kargs.v.batch_stride + at.head * kargs.v.head_stride;
+        const int32_t o_head_base =
+            at.batch * kargs.o.batch_stride + at.head * kargs.o.head_stride;
 
         // Q into A-fragments, once per query tile.
         const index_t q_row_global = q_start + q_row;
@@ -199,14 +131,14 @@ struct Bf16FwdD128Kernel
             q_row_global < kargs.n_q ? q_row_global : kargs.n_q - 1;
         const int32_t q_lane_off =
             q_head_base + static_cast<int32_t>(q_row_safe) * kargs.q.row_stride;
-        typename Wmma::AVecType q_frag[kDTiles];
+        AVecType q_frag[kDTiles];
         ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
             q_frag[d_tile.value] = *reinterpret_cast<const ck_tile::bf16x16_t*>(
                 q_ptr + q_lane_off + d_tile.value * 16);
         });
 
-        typename Wmma::CVecType output[kDTiles] = {};
-        float lane_lse = -__builtin_inff();
+        CVecType output[kDTiles] = {};
+        OnlineLse lse;
 
         const index_t k_lane_bytes = lane_row * kKStride * sizeof(bf16_t);
         // In the swizzled layout the second d-chunk of a pair sits one chunk away
@@ -339,14 +271,14 @@ struct Bf16FwdD128Kernel
             const index_t key_start = tile * kBlockN;
             const bool tail_tile    = key_start + kBlockN > kargs.n_kv;
 
-            typename Wmma::CVecType scores[kNTiles];
+            CVecType scores[kNTiles];
             ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
                 const index_t k_off =
                     kcur + k_lane_bytes +
                     (kSwizzled ? (((2 * d_tile.value) ^ lane_row) * kKPack *
                                   sizeof(bf16_t))
                                : d_tile.value * (2 * kKPack * sizeof(bf16_t)));
-                const typename Wmma::AVecType& q = q_frag[d_tile.value];
+                const AVecType& q = q_frag[d_tile.value];
                 ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                     const index_t base = k_off + n_tile.value * kKStep;
                     const ck_tile::bf16x8_t k_lo =
@@ -354,15 +286,15 @@ struct Bf16FwdD128Kernel
                     const ck_tile::bf16x8_t k_hi =
                         *reinterpret_cast<const ck_tile::bf16x8_t*>(
                             lds + base + k_hi_delta);
-                    typename Wmma::BVecType k;
+                    BVecType k;
                     ck_tile::static_for<0, 8, 1>{}([&](auto j) {
                         k[j.value]     = k_lo[j.value];
                         k[j.value + 8] = k_hi[j.value];
                     });
                     if constexpr(d_tile.value == 0)
-                        WmmaInit(scores[n_tile.value], k, q);
+                        Wmma::Init(scores[n_tile.value], k, q);
                     else
-                        WmmaInPlace(scores[n_tile.value], k, q);
+                        Wmma::InPlace(scores[n_tile.value], k, q);
                 });
             });
 
@@ -402,36 +334,18 @@ struct Bf16FwdD128Kernel
                 local_sum -= static_cast<float>(invalid) * Exp2(-scaled_max);
             }
 
-            const float tile_sum  = local_sum + SwapLaneGroup(local_sum);
-            const float old_lse   = lane_lse;
-            const float new_max   = __builtin_fmaxf(old_lse, scaled_max);
-            const float old_term  = Exp2(old_lse - new_max);
-            const float tile_term = Exp2(scaled_max - new_max);
-            const float combined  = old_term + tile_term * tile_sum;
-            const float inv       = __builtin_amdgcn_rcpf(combined);
-            const float alpha     = old_term * inv;
-            // The probability tile is rounded to bf16 by truncation, whose mean
-            // error is half an ulp. Folding (1 + 2^-9) into beta cancels it.
-            const float beta      = tile_term * inv * 1.001953125f;
-            lane_lse              = new_max + __builtin_amdgcn_logf(combined);
+            const float tile_sum = local_sum + SwapLaneGroup(local_sum);
+            float alpha = 0.0f;
+            float beta  = 0.0f;
+            lse.Update(scaled_max, tile_sum, alpha, beta);
+            // The probability tile is rounded to bf16 by truncation, whose mean error is
+            // half an ulp. Folding (1 + 2^-9) into beta cancels it to first order.
+            beta *= 1.001953125f;
 
-            // Rescale the persistent accumulator: alpha is uniform per query row,
-            // so it is fanned out from the owning lane once per row.
-            const int alpha_bits = ck_tile::bit_cast<int>(alpha);
-            ck_tile::static_for<0, 8, 1>{}([&](auto i) {
-                const int even_alpha =
-                    __builtin_amdgcn_readlane(alpha_bits, i.value * 2);
-                const int odd_alpha =
-                    __builtin_amdgcn_readlane(alpha_bits, i.value * 2 + 1);
-                const float row_alpha = ck_tile::bit_cast<float>(
-                    lane_group == 0 ? even_alpha : odd_alpha);
-                ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
-                    output[d_tile.value][i.value] *= row_alpha;
-                });
-            });
+            RescaleOutput<kDTiles>(output, alpha, lane_group);
 
             // P scaled by beta, then transposed into A-fragment layout.
-            typename Wmma::AVecType p_frag[kNTiles];
+            AVecType p_frag[kNTiles];
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::uint32x8_t words;
                 uint32_t own[4];
@@ -446,7 +360,7 @@ struct Bf16FwdD128Kernel
                     words[k.value + 4] = lane_group == 0 ? partner : own[k.value];
                 });
                 p_frag[n_tile.value] =
-                    ck_tile::bit_cast<typename Wmma::AVecType>(words);
+                    ck_tile::bit_cast<AVecType>(words);
             });
 
             // PV accumulate
@@ -474,12 +388,12 @@ struct Bf16FwdD128Kernel
                     const ck_tile::bf16x8_t v_hi =
                         *reinterpret_cast<const ck_tile::bf16x8_t*>(
                             lds + base + hi_delta);
-                    typename Wmma::BVecType v;
+                    BVecType v;
                     ck_tile::static_for<0, 8, 1>{}([&](auto j) {
                         v[j.value]     = v_lo[j.value];
                         v[j.value + 8] = v_hi[j.value];
                     });
-                    WmmaInPlace(output[d_tile.value], p_frag[n_tile.value], v);
+                    Wmma::InPlace(output[d_tile.value], p_frag[n_tile.value], v);
                 });
             });
 
@@ -535,28 +449,9 @@ struct Bf16FwdD128Kernel
 };
 
 template <bool kHeadFast, index_t kBr, index_t kBc, index_t kBuffers, bool kSwizzled>
-bool LaunchBf16FwdD128(const Bf16FwdParams& params)
+bool LaunchBf16FwdD128(const AttentionFwdParams& params)
 {
-    using Kernel = Bf16FwdD128Kernel<kHeadFast, kBr, kBc, kBuffers, kSwizzled>;
-    const typename Kernel::Kargs kargs{
-        params.q,
-        params.k,
-        params.v,
-        params.o,
-        params.softmax_scale_log2,
-        params.n_q,
-        params.n_kv,
-        params.head_start,
-        params.launch_heads};
-    const auto kernel = ck_tile::make_kernel<Kernel::kWaves, ck_tile::gfx115_t>(
-        Kernel{},
-        dim3(params.grid_size),
-        dim3(Kernel::kBlockSize),
-        0,
-        kargs);
-    (void)hipGetLastError();
-    ck_tile::launch_kernel(ck_tile::stream_config{params.stream}, kernel);
-    return hipPeekAtLastError() == hipSuccess;
+    return LaunchAttentionFwd<Bf16FwdD128Kernel<kHeadFast, kBr, kBc, kBuffers, kSwizzled>>(params);
 }
 
 } // namespace feather_attn

@@ -2,7 +2,7 @@
 
 ## Goal
 
-A new forward attention kernel for gfx1151 that is faster than AITER's Triton `attn_fwd` on the shapes in `bench/benchmark_attn_hip.py`, and that stays correct and reasonably fast on the D128 rows of `docs/input_shapes_attn.md`.
+A new forward attention kernel for gfx1151 that is faster than AITER's Triton `attn_fwd` on the shapes in `bench/benchmark_attn_fwd.py`, and that stays correct and reasonably fast on the D128 rows of `docs/input_shapes_attn.md`.
 
 ## Scope
 
@@ -11,42 +11,43 @@ A new forward attention kernel for gfx1151 that is faster than AITER's Triton `a
 | Dtype | bf16 input and output, fp32 score and output accumulation |
 | Head dimension | 128 only |
 | Attention | dense, non-causal, no bias, no dropout, no window, equal Q/KV heads |
-| Layouts | contiguous 4D `[B,H,N,D]` or `[B,N,H,D]`. The row, head, and batch strides are passed per operand, so Q, K, V, and O may use different layouts |
+| Layouts | contiguous 4D `[B,H,N,D]` or `[B,N,H,D]`, one layout per call for all four operands. The row/head/batch strides are derived in C++ from that layout, so the kernel itself no longer depends on a head count |
 | Shapes | any `batch >= 1`, `heads >= 1`, `n_q >= 1`, `n_kv >= 1` |
 | Grid policy | head-slow (HND) and head-fast (NHD) specializations |
 | Out of scope | D64, fp8/int8 quantization, masks, causal, GQA, backward, public API dispatch |
 
-The kernel is exposed as one opaque op, `feather_attn::attn_bf16_d128_feather`, and driven from Python by `feather_attn/ops_bf16.py`. It is deliberately not wired into `feather_attn.ops.feather_attn`.
+The kernel is exposed as one opaque op, `feather_attn::attn_fwd_bf16_d128_feather`, reached from Python by `feather_attn/ops_bf16.py`. It is deliberately not wired into `feather_attn.ops.feather_attn_func`, which keeps the vendored Triton kernel as the public forward.
 
 ## Result
 
-`bench/benchmark_attn_bf16.py`, `bench/protocol.py` protocol (warm, providers interleaved, median of 7 rounds, paired ratio against AITER measured in the same round). B = 1, D = 128.
+`python -m bench.benchmark_attn_fwd --impls aiter,feather_bf16_d128 --dtypes bf16 --head-dims 128` through `bench/protocol.py`: warm, providers interleaved, median of the round medians, paired ratio against AITER measured in the same round. B = 1, D = 128.
 
 | case | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: |
-| HND H16 N4096 | 29.11 | 31.98 | 1.098x |
-| HND H16 N8192 | 28.44 | 31.69 | 1.114x |
-| HND H16 N16384 | 28.18 | 31.42 | 1.115x |
-| HND H32 N4096 | 27.39 | 30.72 | 1.122x |
-| HND H32 N8192 | 27.10 | 31.57 | 1.165x |
-| HND H32 N16384 | 27.31 | 31.12 | 1.139x |
-| HND H56 N4096 | 26.61 | 30.73 | 1.155x |
-| HND H56 N8192 | 26.97 | 30.87 | 1.145x |
-| HND H56 N16384 | 26.96 | 30.78 | 1.142x |
-| NHD H16 N4096 | 26.29 | 25.81 | 0.982x |
-| NHD H16 N8192 | 26.26 | 27.28 | 1.039x |
-| NHD H16 N16384 | 26.56 | 27.37 | 1.030x |
-| NHD H32 N4096 | 24.39 | 27.22 | 1.116x |
-| NHD H32 N8192 | 24.90 | 27.04 | 1.086x |
-| NHD H32 N16384 | 21.81 | 26.81 | 1.229x |
-| NHD H56 N4096 | 22.98 | 27.45 | 1.194x |
-| NHD H56 N8192 | 23.25 | 27.47 | 1.181x |
-| NHD H56 N16384 | 23.57 | 26.87 | 1.140x |
+| HND H16 N4096 | 29.98 | 32.78 | 1.093x |
+| HND H16 N8192 | 28.64 | 32.11 | 1.121x |
+| HND H16 N16384 | 28.49 | 31.94 | 1.121x |
+| HND H32 N4096 | 27.85 | 31.38 | 1.127x |
+| HND H32 N8192 | 27.67 | 31.93 | 1.154x |
+| HND H32 N16384 | 27.63 | 31.31 | 1.133x |
+| HND H56 N4096 | 26.87 | 31.43 | 1.170x |
+| HND H56 N8192 | 27.28 | 31.30 | 1.147x |
+| HND H56 N16384 | 27.10 | 30.87 | 1.139x |
+| NHD H16 N4096 | 26.50 | 26.80 | 1.011x |
+| NHD H16 N8192 | 26.25 | 28.40 | 1.082x |
+| NHD H16 N16384 | 26.76 | 27.96 | 1.045x |
+| NHD H32 N4096 | 24.31 | 28.03 | 1.153x |
+| NHD H32 N8192 | 24.67 | 28.69 | 1.163x |
+| NHD H32 N16384 | 21.84 | 26.84 | 1.229x |
+| NHD H56 N4096 | 22.77 | 27.02 | 1.187x |
+| NHD H56 N8192 | 23.27 | 27.21 | 1.169x |
+| NHD H56 N16384 | 23.61 | 27.05 | 1.146x |
 
-- Geometric mean over the 18 rows: 1.120x against AITER. HND alone 1.133x, NHD alone 1.108x.
-- 17 of 18 rows beat AITER. The single loss is NHD H16 N4096 at 0.982x, which is 512 workgroups over 20 processors, i.e. a tail-quantisation loss (25.6 rounds of blocks), not a throughput loss.
-- Absolute TFLOPS move with the session: this machine's sustained clock drifts by several percent between runs, and AITER's own number in the same matrix moved from 30.75 to 29.11 between two runs an hour apart. The paired ratio is the stable number.
-* Accuracy against AITER: rel-L2 5.0e-3, maximum elementwise difference 0.0078, and the elementwise ratio against an `atol=rtol=0.02` envelope is at most 0.26 over the contract sweep. Against a blocked fp32 reconstruction, rel-L2 is 4.4e-3 and cosine is 0.999997. The previous fp8-Q kernel measures 5.4e-2 against the same fp32 reconstruction, so this kernel is about 12x more accurate while also being faster.
+Measured with `python -m bench.benchmark_attn_fwd --impls aiter,feather_bf16_d128 --dtypes bf16 --head-dims 128`, i.e. both tile configurations beside the control, with the shipped per-layout choice applied: `HND -> config 1`, `NHD -> config 2`. Raw data: `~/tmp/feather_attn/bf16_fwd/bench/final2.json`:
+- Geometric mean over the 18 rows: 1.132x against AITER. HND alone 1.135x, NHD alone 1.129x.
+- All 18 rows beat AITER. The weakest is NHD H16 N4096 at 1.011x, which is 512 workgroups over 20 processors and therefore the most tail-quantised cell in the matrix.
+- The same matrix measured 1.142x in an earlier session (raw data `post_refactor.json`), so the absolute TFLOPS and the ratio both move by ~1% between sessions. This machine's sustained clock drifts by more than that. The per-row ordering is stable.
+- Accuracy against AITER, gated in `tests/test_attn_fwd_bf16_d128.py`: `atol=rtol=0.02` plus `rel-L2 <= 1e-2`. The measured worst case over the contract is a rel-L2 of 5.0e-3 and an elementwise ratio of 0.26 of the envelope. Against a blocked fp32 reconstruction, rel-L2 is 4.4e-3. Cosine is deliberately not part of any forward gate. It is the backward's primary metric because the optimizer normalizes the gradient magnitude.
 
 ## Why the previous kernel left performance on the table
 
@@ -149,14 +150,15 @@ All global offsets are signed 32-bit element offsets from a per-operand base tha
 
 ### Host policy
 
-- `layout` selects the grid order only: head-fast for `[B,N,H,D]`, head-slow for `[B,H,N,D]`. The per-operand strides come from the tensor, so a mixed-layout call (Q/K HND, V NHD, as several rows in `docs/input_shapes_attn.md` use) works without a transpose.
+- `layout` selects both the grid order (head-fast for `[B,N,H,D]`, head-slow for `[B,H,N,D]`) and which of the two middle axes is the sequence axis. One layout applies to all four operands: the kernel ABI carries per-operand strides, but a mixed call (Q/K HND, V NHD, as some rows in `docs/input_shapes_attn.md` use) would need a per-operand axis hint that neither the operator schema nor the host provides, so it is not supported. Transpose the odd operand out, or extend the schema.
+- `softmax_scale` is an operator argument (`1/sqrt(D)` when omitted) and travels through the ABI as `log2(e) * softmax_scale`, the same convention and default as `feather_attn_bwd`, so a forward and a backward cannot disagree about it.
 - No NHD head grouping. The previous kernel grouped NHD heads into LLC-sized sublaunches, which was worth 13% there. With 256-row workgroups the K/V traffic is already halved and each workgroup streams its own tile, so the grouping is now a loss: measured +3.0%, +6.6% and +8.6% on three NHD rows when it is disabled, and it is gone.
 - Config selection is `head_fast ? 2 : 1`, with the 128-row config reserved for `n_q < 256`.
 
 ## Verification
 
-- `tests/test_attn_bf16_d128.py`: 318 cases, all passing. Every shape of `docs/input_shapes_attn.md`'s contract family is covered for both layouts against AITER at `atol=rtol=0.02`, plus an independent blocked-fp32 anchor on the small shapes. The sweep includes lengths 1 through 16,385, both tails, independent query and KV tails, odd and large head counts, `n_q > n_kv` cross-attention, batch two, and the `1023/1024/1025` boundary.
-- `tests/test_attn_hip.py` (the existing fp8 kernel, 188 cases) still passes unchanged.
+- `tests/test_attn_fwd_bf16_d128.py`: 318 cases, all passing. Every shape of `docs/input_shapes_attn.md`'s contract family is covered for both layouts against AITER at `atol=rtol=0.02`, plus an independent blocked-fp32 anchor on the small shapes. The sweep includes lengths 1 through 16,385, both tails, independent query and KV tails, odd and large head counts, `n_q > n_kv` cross-attention, batch two, and the `1023/1024/1025` boundary.
+- `tests/test_attn_fwd_fp16_q8.py` (the existing fp8 kernel, 188 cases) still passes unchanged.
 - `ruff check`, `ruff format`, and `ty check` are clean on the Python additions.
 
 ## Rejected or not pursued
@@ -183,9 +185,9 @@ All global offsets are signed 32-bit element offsets from a per-operand base tha
 
 ## Artifacts
 
-- Kernel: `csrc/fwd/bf16/bf16_fwd_d128_kernel.h`, `bf16_fwd_d128_image.cu` (instantiations), `bf16_fwd_d128.cpp` (host and op), `bf16_fwd_params.h` (ABI).
+- Kernel: `csrc/fwd/bf16/bf16_fwd_d128_kernel.h`, `bf16_fwd_d128_image.cu` (instantiations), `bf16_fwd_d128.cpp` (host and op). The ABI is `csrc/attention_args.h` and the host helpers are `csrc/attention_host.h`.
 - Python: `feather_attn/ops_bf16.py`.
-- Test: `tests/test_attn_bf16_d128.py`.
-- Bench: `bench/benchmark_attn_bf16.py`.
+- Test: `tests/test_attn_fwd_bf16_d128.py`.
+- Bench: `bench/benchmark_attn_fwd.py`.
 - Measurements and the tuning campaign: `~/tmp/feather_attn/bf16_fwd/` (`bench/final_matrix.{json,log}`, `correctness_final.log`, `loop_analysis2.txt`, `probe_degenerate.py`, `tol_probe.py`).
 - Prior-art analysis for the fp8-Q kernel: `~/tmp/feather_attn/q16_analysis/REPORT.md`.

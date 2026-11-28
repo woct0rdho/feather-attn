@@ -6,10 +6,10 @@
 
 namespace feather_attn {
 
-#define FEATHER_ATTN_BF16_D128_IMAGE(name, head_fast, br, bc, buf, swz)              \
-    extern "C" bool feather_attn_fwd_bf16_d128_##name(const Bf16FwdParams& params)   \
-    {                                                                                \
-        return LaunchBf16FwdD128<head_fast, br, bc, buf, swz>(params);               \
+#define FEATHER_ATTN_BF16_D128_IMAGE(name, head_fast, br, bc, buf, swz)                 \
+    extern "C" bool feather_attn_fwd_bf16_d128_##name(const AttentionFwdParams& params) \
+    {                                                                                   \
+        return LaunchBf16FwdD128<head_fast, br, bc, buf, swz>(params);                  \
     }
 
 // 256-row tiles with 64 keys and double-buffered swizzled LDS: the HND default.

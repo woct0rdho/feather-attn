@@ -1,18 +1,25 @@
+// Forward attention with an E5M2-quantized Q tile, fp16 storage, fp32 accumulation.
+//
+// Row-owned FlashAttention-2 topology: one workgroup owns kBlockM query rows of one
+// physical head, each wave owns 16 of those rows from score generation through softmax to
+// the persistent output accumulator. Scores are computed transposed (K * Q^T) so a lane
+// holds 8 keys of the single query lane%16 and the softmax needs no cross-lane reduction.
+//
+// Q is the only quantized operand: it is the operand that is read once per query tile,
+// while K and V are re-read once per query tile for every query tile, so the quantization
+// only pays for itself on Q. gfx1151 has no fp8 WMMA and no fp8 conversion instruction, so
+// the E5M2 tile is decoded back to fp16 immediately before the WMMA.
+//
+// The ABI, the block decomposition, the WMMA wrapper, the log-domain softmax recurrence
+// and the accumulator rescale are shared with the bf16 kernel (csrc/attention_fwd.h).
+
 #pragma once
 
-#include <__clang_cuda_math_forward_declares.h>
 #include <hip/hip_runtime.h>
 
-#include "launch_params.h"
-
-#if defined(_WIN32)
-#include <__clang_hip_math.h>
-#endif
 #include <ck_tile/core.hpp>
-#include <ck_tile/host/kernel_launch.hpp>
-#include <ck_tile/ops/gemm/warp/warp_gemm_attribute_mfma.hpp>
-#include <ck_tile/ops/gemm/warp/warp_gemm_params.hpp>
-#include <ck_tile/ops/gemm/warp/warp_wmma_gemm.hpp>
+
+#include "attention_fwd.h"
 
 #include <cstdint>
 
@@ -60,6 +67,7 @@ struct Q8Ops
     }
 };
 
+// K tile layout: 8-fp16 chunks xor-swizzled by the key row.
 struct QKOps
 {
     static constexpr index_t kKPack = 8;
@@ -73,15 +81,10 @@ struct QKOps
     }
 };
 
-struct SoftmaxOps
+// Transposed C fragment -> WMMA A fragment for the PV GEMM. Type-specific to fp16.
+struct PTransposeOps
 {
-    using Wmma = ck_tile::WarpGemmAttributeWmmaImpl<
-        ck_tile::WmmaTraits<ck_tile::gfx11_t, fp16_t, fp16_t, float, 16, 16, 16>>;
-
-    CK_TILE_DEVICE static float Exp2(float value)
-    {
-        return __builtin_amdgcn_exp2f(value);
-    }
+    using Wmma = WmmaOps<fp16_t>;
 
     CK_TILE_DEVICE static typename Wmma::AVecType TransposedCFragToA(
         const typename Wmma::CVecType& fragment,
@@ -93,8 +96,7 @@ struct SoftmaxOps
             pair[0]          = ck_tile::type_convert<fp16_t>(fragment[i.value * 2]);
             pair[1]          = ck_tile::type_convert<fp16_t>(fragment[i.value * 2 + 1]);
             const uint32_t v = ck_tile::bit_cast<uint32_t>(pair);
-            const uint32_t w = __builtin_amdgcn_permlanex16(
-                0u, v, 0x76543210u, 0xfedcba98u, false, true);
+            const uint32_t w = SwapLaneGroupBits(v);
             const uint32_t selector_0 = lane < 16 ? 0x05040100u : 0x01000504u;
             const uint32_t selector_1 = lane < 16 ? 0x07060302u : 0x03020706u;
             words[i.value * 2]     = __builtin_amdgcn_perm(w, v, selector_0);
@@ -102,24 +104,18 @@ struct SoftmaxOps
         });
         return ck_tile::bit_cast<typename Wmma::AVecType>(words);
     }
-
-    CK_TILE_DEVICE static float SwapLaneGroup(float value)
-    {
-        const uint32_t bits = __builtin_bit_cast(uint32_t, value);
-        return __builtin_bit_cast(
-            float,
-            __builtin_amdgcn_permlanex16(
-                0u, bits, 0x76543210u, 0xfedcba98u, false, true));
-    }
 };
 
-// Fused forward kernel with fp8 (E5M2) quantization of Q.
 template <index_t kHeadDimValue, bool kNHD, bool kPadQ, bool kPadKV>
-struct FwdFp8Kernel
+struct Fp16Q8FwdKernel
 {
-    using Wmma = SoftmaxOps::Wmma;
+    using Wmma = WmmaOps<fp16_t>;
+    using CVecType = typename Wmma::CVecType;
+    using AVecType = typename Wmma::AVecType;
+    using BVecType = typename Wmma::BVecType;
 
-    static constexpr index_t kBlockSize  = 256;
+    static constexpr index_t kBlockSize  = Q8Ops::kNumWaves * 32;
+    static constexpr index_t kWaves      = Q8Ops::kNumWaves;
     static constexpr index_t kBlockM     = 128;
     static constexpr index_t kBlockN     = 64;
     static constexpr index_t kHeadDim    = kHeadDimValue;
@@ -138,28 +134,6 @@ struct FwdFp8Kernel
     static constexpr index_t kCachedQTiles =
         kHeadDim == 64 && !kNHD ? (kPadKV && !kPadQ ? 3 : kDTiles) : 0;
 
-    struct Kargs
-    {
-        const fp16_t* q_ptr;
-        const fp16_t* k_ptr;
-        const fp16_t* v_ptr;
-        fp16_t* o_ptr;
-        float q_scale_log2;
-        int32_t n_q;
-        int32_t n_kv;
-        int32_t num_heads;
-        int32_t head_start;
-        int32_t launch_heads;
-#if defined(FEATHER_ATTN_STRIDED_NHD)
-        int32_t group_index;
-        int32_t group_count;
-#endif
-    };
-
-#if defined(FEATHER_ATTN_STRIDED_NHD)
-    static_assert(kNHD && sizeof(Kargs) == 64);
-#endif
-
     CK_TILE_DEVICE static index_t VLdsOffset(index_t d_row, index_t n_chunk)
     {
         const index_t d_phase = (d_row ^ (d_row / kVChunks)) % kVChunks;
@@ -176,18 +150,7 @@ struct FwdFp8Kernel
                sizeof(fp16_t);
     }
 
-    CK_TILE_DEVICE static void WmmaInPlace(
-        typename Wmma::CVecType& c,
-        const typename Wmma::AVecType& a,
-        const typename Wmma::BVecType& b)
-    {
-        asm volatile(
-            "v_wmma_f32_16x16x16_f16 %0, %1, %2, %0"
-            : "+v"(c)
-            : "v"(a), "v"(b));
-    }
-
-    CK_TILE_DEVICE void operator()(Kargs kargs) const
+    CK_TILE_DEVICE void operator()(AttentionFwdArgs kargs) const
     {
         constexpr auto q_lds_desc = Q8Ops::MakeLdsDescriptor<kDTiles>();
         alignas(16) __shared__ uint8_t lds[kLdsBytes];
@@ -200,56 +163,33 @@ struct FwdFp8Kernel
         const index_t lane_row   = lane % kLaneRows;
         const index_t lane_group = lane / kLaneRows;
         const index_t q_row      = wave * kLaneRows + lane_row;
-        index_t q_tiles          = kargs.n_q / kBlockM;
-        if constexpr(kPadQ)
-            q_tiles += kargs.n_q % kBlockM != 0;
-        const index_t block = ck_tile::get_block_1d_id();
-        index_t q_tile;
-        index_t q_head_offset;
-        index_t kv_head_offset;
-        if constexpr(kNHD)
-        {
-#if defined(FEATHER_ATTN_STRIDED_NHD)
-            const index_t local_head = block % kargs.launch_heads;
-            const index_t head =
-                kargs.group_index + local_head * kargs.group_count;
-            if(head >= kargs.num_heads)
-                return;
-            const index_t tile_batch = block / kargs.launch_heads;
-            q_tile                   = tile_batch % q_tiles;
-            const index_t batch      = tile_batch / q_tiles;
-            q_head_offset =
-                (batch * kargs.n_q * kargs.num_heads + head) * kHeadDim;
-            kv_head_offset =
-                (batch * kargs.n_kv * kargs.num_heads + head) * kHeadDim;
-#else
-            const index_t local_head = block % kargs.launch_heads;
-            const index_t head       = kargs.head_start + local_head;
-            const index_t tile_batch = block / kargs.launch_heads;
-            q_tile                   = tile_batch % q_tiles;
-            const index_t batch      = tile_batch / q_tiles;
-            q_head_offset =
-                (batch * kargs.n_q * kargs.num_heads + head) * kHeadDim;
-            kv_head_offset =
-                (batch * kargs.n_kv * kargs.num_heads + head) * kHeadDim;
-#endif
-        }
-        else
-        {
-            q_tile                    = block % q_tiles;
-            const index_t head_linear = block / q_tiles;
-            q_head_offset  = head_linear * kargs.n_q * kHeadDim;
-            kv_head_offset = head_linear * kargs.n_kv * kHeadDim;
-        }
-        const index_t q_start = q_tile * kBlockM;
-        const index_t q_row_stride = kNHD ? kargs.num_heads * kHeadDim : kHeadDim;
-        const index_t kv_row_stride = q_row_stride;
+        const index_t q_tiles    = (kargs.n_q + kBlockM - 1) / kBlockM;
+        const index_t block      = ck_tile::get_block_1d_id();
+        const AttentionBlockIndex at = DecodeAttentionBlock<kNHD>(block, q_tiles, kargs);
+
+        const int32_t q_head_base =
+            at.batch * kargs.q.batch_stride + at.head * kargs.q.head_stride;
+        const int32_t k_head_base =
+            at.batch * kargs.k.batch_stride + at.head * kargs.k.head_stride;
+        const int32_t v_head_base =
+            at.batch * kargs.v.batch_stride + at.head * kargs.v.head_stride;
+        const int32_t o_head_base =
+            at.batch * kargs.o.batch_stride + at.head * kargs.o.head_stride;
+
+        const index_t q_row_stride  = kargs.q.row_stride;
+        const index_t kv_row_stride = kargs.k.row_stride;
+        const index_t q_start       = at.q_tile * kBlockM;
+
+        const fp16_t* const q_ptr = reinterpret_cast<const fp16_t*>(kargs.q.ptr);
+        const fp16_t* const k_ptr = reinterpret_cast<const fp16_t*>(kargs.k.ptr);
+        const fp16_t* const v_ptr = reinterpret_cast<const fp16_t*>(kargs.v.ptr);
+        fp16_t* const o_ptr = reinterpret_cast<fp16_t*>(const_cast<void*>(kargs.o.ptr));
+
         const fp16_t* const q_tile_ptr =
-            kargs.q_ptr + q_head_offset + q_start * q_row_stride;
-        const fp16_t* const k_head_ptr = kargs.k_ptr + kv_head_offset;
-        const fp16_t* const v_head_ptr = kargs.v_ptr + kv_head_offset;
-        fp16_t* const o_tile_ptr =
-            kargs.o_ptr + q_head_offset + q_start * q_row_stride;
+            q_ptr + q_head_base + q_start * q_row_stride;
+        const fp16_t* const k_head_ptr = k_ptr + k_head_base;
+        const fp16_t* const v_head_ptr = v_ptr + v_head_base;
+        fp16_t* const o_tile_ptr = o_ptr + o_head_base + q_start * q_row_stride;
 
         ck_tile::static_for<0, kDTiles / 2, 1>{}([&](auto i) {
             constexpr index_t d_tile_in_group = i.value * 2;
@@ -270,7 +210,7 @@ struct FwdFp8Kernel
             ck_tile::uint8x16_t q8;
             ck_tile::static_for<0, kDPerWmma, 1>{}([&](auto j) {
                 const float scaled =
-                    ck_tile::type_convert<float>(q[j.value]) * kargs.q_scale_log2;
+                    ck_tile::type_convert<float>(q[j.value]) * kargs.softmax_scale_log2;
                 q8[j.value] =
                     Q8Ops::EncodeE5M2(ck_tile::type_convert<fp16_t>(scaled));
             });
@@ -280,11 +220,11 @@ struct FwdFp8Kernel
             *reinterpret_cast<ck_tile::uint8x16_t*>(q_lds + q_lds_offset) = q8;
         });
 
-        typename Wmma::CVecType output[kDTiles] = {};
+        CVecType output[kDTiles] = {};
         uint32_t store_wave;
         asm volatile("v_readfirstlane_b32 %0, %1" : "=s"(store_wave) : "v"(wave));
-        float lane_lse = -__builtin_inff();
-        typename Wmma::AVecType cached_q[kCachedQTiles > 0 ? kCachedQTiles : 1] = {};
+        OnlineLse lse;
+        AVecType cached_q[kCachedQTiles > 0 ? kCachedQTiles : 1] = {};
 
         #pragma unroll 1
         for(index_t key_start = 0; key_start < kargs.n_kv; key_start += kBlockN)
@@ -314,11 +254,11 @@ struct FwdFp8Kernel
 
             ck_tile::block_sync_lds();
 
-            typename Wmma::CVecType scores[kNTiles] = {};
+            CVecType scores[kNTiles];
             ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
                 const index_t q_lds_offset = q_lds_desc.calculate_offset(
                     ck_tile::make_tuple(wave, d_tile.value, lane_row, index_t{0}));
-                typename Wmma::AVecType q;
+                AVecType q;
                 if constexpr(d_tile.value < kCachedQTiles)
                 {
                     if(key_start == 0)
@@ -338,12 +278,15 @@ struct FwdFp8Kernel
                         kv_lds + QKOps::LdsOffset<kHeadDim>(k_row, chunk_0));
                     const auto k_hi = *reinterpret_cast<const ck_tile::fp16x8_t*>(
                         kv_lds + QKOps::LdsOffset<kHeadDim>(k_row, chunk_0 + 1));
-                    typename Wmma::BVecType k;
+                    BVecType k;
                     ck_tile::static_for<0, 8, 1>{}([&](auto j) {
                         k[j.value]     = k_lo[j.value];
                         k[j.value + 8] = k_hi[j.value];
                     });
-                    WmmaInPlace(scores[n_tile.value], k, q);
+                    if constexpr(d_tile.value == 0)
+                        Wmma::Init(scores[n_tile.value], k, q);
+                    else
+                        Wmma::InPlace(scores[n_tile.value], k, q);
                 });
             });
 
@@ -365,40 +308,23 @@ struct FwdFp8Kernel
                     row_max = __builtin_fmaxf(row_max, scores[n_tile.value][i.value]);
                 });
             });
-            row_max = __builtin_fmaxf(row_max, SoftmaxOps::SwapLaneGroup(row_max));
+            row_max = __builtin_fmaxf(row_max, SwapLaneGroup(row_max));
 
             float local_sum = 0.0f;
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::static_for<0, 8, 1>{}([&](auto i) {
                     const float p =
-                        SoftmaxOps::Exp2(scores[n_tile.value][i.value] - row_max);
+                        Exp2(scores[n_tile.value][i.value] - row_max);
                     scores[n_tile.value][i.value] = p;
                     local_sum += p;
                 });
             });
-            const float tile_sum  = local_sum + SoftmaxOps::SwapLaneGroup(local_sum);
-            const float old_lse   = lane_lse;
-            const float new_max   = __builtin_fmaxf(old_lse, row_max);
-            const float old_term  = SoftmaxOps::Exp2(old_lse - new_max);
-            const float tile_term = SoftmaxOps::Exp2(row_max - new_max);
-            const float combined  = old_term + tile_term * tile_sum;
-            const float reciprocal = __builtin_amdgcn_rcpf(combined);
-            const float alpha      = old_term * reciprocal;
-            const float beta       = tile_term * reciprocal;
-            lane_lse               = new_max + __builtin_amdgcn_logf(combined);
+            const float tile_sum = local_sum + SwapLaneGroup(local_sum);
+            float alpha = 0.0f;
+            float beta  = 0.0f;
+            lse.Update(row_max, tile_sum, alpha, beta);
 
-            const int alpha_bits = __builtin_bit_cast(int, alpha);
-            ck_tile::static_for<0, 8, 1>{}([&](auto i) {
-                const int even_alpha_bits =
-                    __builtin_amdgcn_readlane(alpha_bits, i.value * 2);
-                const int odd_alpha_bits =
-                    __builtin_amdgcn_readlane(alpha_bits, i.value * 2 + 1);
-                const float row_alpha = __builtin_bit_cast(
-                    float, lane_group == 0 ? even_alpha_bits : odd_alpha_bits);
-                ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
-                    output[d_tile.value][i.value] *= row_alpha;
-                });
-            });
+            RescaleOutput<kDTiles>(output, alpha, lane_group);
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                 ck_tile::static_for<0, 8, 1>{}([&](auto i) {
                     scores[n_tile.value][i.value] *= beta;
@@ -460,20 +386,19 @@ struct FwdFp8Kernel
             ck_tile::block_sync_lds();
 
             ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
-                const typename Wmma::AVecType p =
-                    SoftmaxOps::TransposedCFragToA(scores[n_tile.value], lane);
+                const AVecType p = PTransposeOps::TransposedCFragToA(scores[n_tile.value], lane);
                 ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
                     const index_t d_row = d_tile.value * kDPerWmma + kv_lane_row;
                     const auto v_lo = *reinterpret_cast<const ck_tile::fp16x8_t*>(
                         kv_lds + VLdsOffset(d_row, n_tile.value * 2));
                     const auto v_hi = *reinterpret_cast<const ck_tile::fp16x8_t*>(
                         kv_lds + VLdsOffset(d_row, n_tile.value * 2 + 1));
-                    typename Wmma::BVecType v;
+                    BVecType v;
                     ck_tile::static_for<0, 8, 1>{}([&](auto j) {
                         v[j.value]     = v_lo[j.value];
                         v[j.value + 8] = v_hi[j.value];
                     });
-                    WmmaInPlace(output[d_tile.value], p, v);
+                    Wmma::InPlace(output[d_tile.value], p, v);
                 });
             });
 
@@ -504,67 +429,12 @@ struct FwdFp8Kernel
     }
 };
 
-#if defined(FEATHER_ATTN_STRIDED_NHD)
+// One launcher for every image of this family. The image selects head dim and tail modes.
 template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
-bool LaunchFwdFp8Variant(const StridedLaunchParams& params)
-{
-    static_assert(kHeadDim == 64 && kNHD);
-    using Kernel = FwdFp8Kernel<kHeadDim, kNHD, kPadQ, kPadKV>;
-    constexpr float q_scale_log2 =
-        kHeadDim == 64 ? 0.18033688011112042f : 0.12751743082459868f;
-    const typename Kernel::Kargs kargs{
-        reinterpret_cast<const fp16_t*>(params.q_ptr),
-        reinterpret_cast<const fp16_t*>(params.k_ptr),
-        reinterpret_cast<const fp16_t*>(params.v_ptr),
-        reinterpret_cast<fp16_t*>(params.o_ptr),
-        q_scale_log2,
-        params.n_q,
-        params.n_kv,
-        params.num_heads,
-        0,
-        params.launch_heads,
-        params.group_index,
-        params.group_count};
-    static_assert(sizeof(kargs) == 64);
-    const auto kernel = ck_tile::make_kernel<8, ck_tile::gfx115_t>(
-        Kernel{},
-        dim3(params.grid_size),
-        dim3(Kernel::kBlockSize),
-        0,
-        kargs);
-    (void)hipGetLastError();
-    ck_tile::launch_kernel(ck_tile::stream_config{params.stream}, kernel);
-    return hipPeekAtLastError() == hipSuccess;
-}
-#else
-template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
-bool LaunchFwdFp8Variant(const LaunchParams& params)
+bool LaunchFp16Q8Fwd(const AttentionFwdParams& params)
 {
     static_assert(kHeadDim == 64 || kHeadDim == 128);
-    using Kernel = FwdFp8Kernel<kHeadDim, kNHD, kPadQ, kPadKV>;
-    constexpr float q_scale_log2 =
-        kHeadDim == 64 ? 0.18033688011112042f : 0.12751743082459868f;
-    const typename Kernel::Kargs kargs{
-        reinterpret_cast<const fp16_t*>(params.q_ptr),
-        reinterpret_cast<const fp16_t*>(params.k_ptr),
-        reinterpret_cast<const fp16_t*>(params.v_ptr),
-        reinterpret_cast<fp16_t*>(params.o_ptr),
-        q_scale_log2,
-        params.n_q,
-        params.n_kv,
-        params.num_heads,
-        params.head_start,
-        params.launch_heads};
-    const auto kernel = ck_tile::make_kernel<8, ck_tile::gfx115_t>(
-        Kernel{},
-        dim3(params.grid_size),
-        dim3(Kernel::kBlockSize),
-        0,
-        kargs);
-    (void)hipGetLastError();
-    ck_tile::launch_kernel(ck_tile::stream_config{params.stream}, kernel);
-    return hipPeekAtLastError() == hipSuccess;
+    return LaunchAttentionFwd<Fp16Q8FwdKernel<kHeadDim, kNHD, kPadQ, kPadKV>>(params);
 }
-#endif
 
 } // namespace feather_attn

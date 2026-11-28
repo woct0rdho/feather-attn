@@ -2,11 +2,12 @@ from itertools import product
 
 import pytest
 import torch
-from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as flash_attn_2
 
 from feather_attn import feather_attn_bwd
+from feather_attn.contract import LAYOUTS
+from feather_attn.reference import aiter_fwd_lse
+from tests.reference import cosine, elementwise_ratio, rel_l2
 
-LAYOUTS = ("HND", "NHD")
 DTYPES = ((torch.float16, "fp16"), (torch.bfloat16, "bf16"))
 D64_SHAPES = (
     (1, 16, 33, 35),
@@ -82,47 +83,38 @@ def _saved_state(
     layout: str,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """A forward pass to differentiate, in the caller's layout, produced by AITER."""
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
-    q_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=dtype, generator=generator)
-    k_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=dtype, generator=generator)
-    v_hnd = torch.randn((batch, heads, n_kv, head_dim), device="cuda", dtype=dtype, generator=generator)
-    dout_hnd = torch.randn((batch, heads, n_q, head_dim), device="cuda", dtype=dtype, generator=generator)
+    hnd = lambda *shape: torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
+    to_layout = (lambda t: t) if layout == "HND" else (lambda t: t.transpose(1, 2).contiguous())
+    q = to_layout(hnd(batch, heads, n_q, head_dim))
+    k = to_layout(hnd(batch, heads, n_kv, head_dim))
+    v = to_layout(hnd(batch, heads, n_kv, head_dim))
+    dout = to_layout(hnd(batch, heads, n_q, head_dim))
     scale = head_dim**-0.5
-    out_bshd, lse, _, _ = flash_attn_2.fwd(
-        q_hnd.transpose(1, 2),
-        k_hnd.transpose(1, 2),
-        v_hnd.transpose(1, 2),
-        out=None,
-        alibi_slopes=None,
-        dropout_p=0.0,
-        softmax_scale=scale,
-        causal=False,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        return_softmax=False,
-    )
-    if layout == "HND":
-        return q_hnd, k_hnd, v_hnd, out_bshd.transpose(1, 2).contiguous(), lse.contiguous(), dout_hnd, scale
-    return (
-        q_hnd.transpose(1, 2).contiguous(),
-        k_hnd.transpose(1, 2).contiguous(),
-        v_hnd.transpose(1, 2).contiguous(),
-        out_bshd.contiguous(),
-        lse.contiguous(),
-        dout_hnd.transpose(1, 2).contiguous(),
-        scale,
-    )
+    out, lse = aiter_fwd_lse(q, k, v, layout, scale)
+    return q, k, v, out.contiguous(), lse, dout, scale
 
 
-def _assert_close(actual: torch.Tensor, expected: torch.Tensor, n_kv: int) -> None:
-    tolerance_factor = 0.10 if n_kv < 1024 else 0.05
-    tolerance = tolerance_factor + tolerance_factor * expected.float().abs()
-    difference = actual.float() - expected.float()
-    tolerance_ratio = float((difference.abs() / tolerance).max())
-    assert torch.isfinite(actual).all()
-    assert torch.all(difference.abs() <= tolerance), f"tol_ratio={tolerance_ratio:.3g}"
+COSINE = 0.99995
+REL_L2 = 1.0e-2
+RTOL_SMALL_KV = 0.10
+RTOL = 0.05
+KV_THRESHOLD = 1024
+
+
+def _assert_close(actual: torch.Tensor, expected: torch.Tensor, n_kv: int, label: str = "") -> None:
+    # Cosine first: the optimizer normalizes the gradient magnitude, so a direction error is
+    # what matters and a uniform scale is not. Measured 1 - cos is below 1e-6.
+    cos = cosine(actual, expected)
+    assert torch.isfinite(actual).all(), f"{label}: not finite"
+    assert cos >= COSINE, f"{label}: cosine={cos:.8f} below {COSINE}"
+    error = rel_l2(actual, expected)
+    assert error <= REL_L2, f"{label}: rel_l2={error:.3g}"
+    factor = RTOL_SMALL_KV if n_kv < KV_THRESHOLD else RTOL
+    worst = elementwise_ratio(actual, expected, factor)
+    assert worst <= 1.0, f"{label}: worst element at {worst:.3g} of the atol=rtol={factor} envelope"
 
 
 @pytest.mark.parametrize(
@@ -145,8 +137,8 @@ def test_feather_attn_bwd_matches_saved_state_reference(
         actual = feather_attn_bwd(dout, q, k, v, out, lse, softmax_scale=scale, layout=layout)
         assert all(result.dtype == dtype for result in actual[:3])
         assert actual[3].dtype == torch.float32
-        for result, reference in zip(actual, expected):
-            _assert_close(result, reference, n_kv)
+        for name, result, reference in zip(("dq", "dk", "dv", "delta"), actual, expected):
+            _assert_close(result, reference, n_kv, label=f"{name} {layout} D{head_dim}")
 
 
 @pytest.mark.parametrize("dtype", [pytest.param(dtype, id=name) for dtype, name in DTYPES])
@@ -158,35 +150,12 @@ def test_nhd_hnd_bwd_dispatch_is_exact(head_dim: int, dtype: torch.dtype) -> Non
         direct_delta = torch.empty_like(lse)
         if head_dim == 128:
             direct_dq_acc = torch.empty_like(q, dtype=torch.float32)
-            torch.ops.feather_attn.attn_bwd_feather_fused.default(
-                dout,
-                q,
-                k,
-                v,
-                out,
-                lse,
-                *direct,
-                direct_delta,
-                direct_dq_acc,
-                scale,
-                1,
-            )
+            torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, lse, *direct, direct_delta, direct_dq_acc, 1, scale)
         else:
-            torch.ops.feather_attn.attn_bwd_feather.default(
-                dout,
-                q,
-                k,
-                v,
-                out,
-                lse,
-                *direct,
-                direct_delta,
-                scale,
-                1,
-            )
+            torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, lse, *direct, direct_delta, 1, scale)
         selected = feather_attn_bwd(dout, q, k, v, out, lse, softmax_scale=scale)
         if head_dim == 128:
-            _assert_close(selected[0], direct[0], q.shape[1])
+            _assert_close(selected[0], direct[0], q.shape[1], label="dispatch dq")
             assert torch.equal(selected[1], direct[1])
             assert torch.equal(selected[2], direct[2])
             assert torch.equal(selected[3], direct_delta)

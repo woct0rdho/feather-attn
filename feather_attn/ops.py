@@ -3,25 +3,7 @@ from torch.library import custom_op
 
 from .aiter_kernels import bwd_aiter_out, fwd_aiter_out
 from .aiter_vendored import fwd_out
-from .layout import to_hnd
-
-
-def feather_attn(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    layout: str,
-) -> torch.Tensor:
-    if layout == "HND":
-        layout_id = 0
-    elif layout == "NHD":
-        layout_id = 1
-    else:
-        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout}")
-
-    out = torch.empty_like(q)
-    torch.ops.feather_attn.attn_fp16_feather.default(q, k, v, out, layout_id)
-    return out
+from .layout import pack_hnd
 
 
 # Benchmarked including all transpose and copy costs
@@ -86,9 +68,9 @@ def _bwd_out(
     # kernels for few heads / short keys. The key length is a runtime value under
     # `torch.compile`, so the choice is made here instead of branching in the traced graph.
     if q.shape[-1] == 128 and (layout_id == 0 or q.shape[2] >= 32 or k.shape[1] >= 8192):
-        torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, softmax_scale, layout_id)
+        torch.ops.feather_attn.attn_bwd_feather_fused.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, dq_acc, layout_id, softmax_scale)
     else:
-        torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, softmax_scale, layout_id)
+        torch.ops.feather_attn.attn_bwd_feather.default(dout, q, k, v, out, softmax_lse, dq, dk, dv, delta, layout_id, softmax_scale)
 
 
 def _feather_bwd(
@@ -106,11 +88,11 @@ def _feather_bwd(
     softmax_lse = softmax_lse.contiguous()
 
     if use_hnd:
-        dout_h = to_hnd(dout)
-        q_h = to_hnd(q)
-        k_h = to_hnd(k)
-        v_h = to_hnd(v)
-        out_h = to_hnd(out)
+        dout_h = pack_hnd(dout)
+        q_h = pack_hnd(q)
+        k_h = pack_hnd(k)
+        v_h = pack_hnd(v)
+        out_h = pack_hnd(out)
         dq = torch.empty_like(q_h)
         dk = torch.empty_like(k_h)
         dv = torch.empty_like(v_h)

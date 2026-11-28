@@ -1,6 +1,6 @@
 #include <hip/hip_runtime.h>
 
-#include "launch_params.h"
+#include "bwd/bwd_params.h"
 
 #include <cstdint>
 #include <type_traits>

@@ -5,13 +5,13 @@ from aiter.ops.triton._triton_kernels.attention.dao_ai import interface_v2 as fl
 from torch._inductor.utils import run_and_get_code
 
 from feather_attn import feather_attn_func
+from feather_attn.reference import aiter_fwd_bshd
 
 DTYPE = torch.bfloat16
 
 
 def _aiter_fwd(q, k, v, scale, causal):
-    out, lse, _, _ = flash_attn_2.fwd(q, k, v, None, None, 0.0, scale, causal, -1, -1, 0.0, False)
-    return out, lse
+    return aiter_fwd_bshd(q, k, v, scale, causal=causal)
 
 
 def _aiter_bwd(dout, q, k, v, out, lse, scale, causal):

@@ -11,12 +11,11 @@ ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "csrc"
 SOURCES = [
     "csrc/extension.cpp",
-    "csrc/fwd/fwd_fp8.cpp",
-    "csrc/fwd/fwd_fp8_aligned.cu",
-    "csrc/fwd/fwd_fp8_query_tail.cu",
-    "csrc/fwd/fwd_fp8_key_tail.cu",
-    "csrc/fwd/fwd_fp8_query_key_tail.cu",
-    "csrc/fwd/fwd_fp8_strided.cu",
+    "csrc/fwd/fp16_q8/fp16_q8_fwd.cpp",
+    "csrc/fwd/fp16_q8/fp16_q8_fwd_aligned.cu",
+    "csrc/fwd/fp16_q8/fp16_q8_fwd_query_tail.cu",
+    "csrc/fwd/fp16_q8/fp16_q8_fwd_key_tail.cu",
+    "csrc/fwd/fp16_q8/fp16_q8_fwd_query_key_tail.cu",
     "csrc/fwd/bf16/bf16_fwd_d128.cpp",
     "csrc/fwd/bf16/bf16_fwd_d128_image.cu",
     "csrc/bwd/bwd.cpp",
@@ -77,6 +76,7 @@ def _ck_include_dir() -> Path:
 
 if not cpp_extension.IS_HIP_EXTENSION:
     raise RuntimeError("feather-attn requires a ROCm-enabled PyTorch build.")
+
 
 _enable_ccache()
 
