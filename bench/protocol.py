@@ -4,18 +4,17 @@ One provider measurement is: warmup, then `rounds` rounds of `iters` back-to-bac
 event pair, reported as the median over rounds of the per-launch milliseconds plus the p20/p80 spread.
 Providers in a case are interleaved and their order alternates between rounds, so the sustained-clock
 drift of this machine hits every provider alike and the ratio against the control is a paired median
-of per-round ratios instead of a ratio of medians measured minutes apart.
+of per-round ratios instead of a ratio of medians taken at different times.
 
 Why not `triton.testing.do_bench`:
 - it flushes L2 between iterations, so every launch is timed cold. That is right for a one-shot
-  streaming kernel and wrong for a model that calls the same weight repeatedly: the same tile measures
-  22.9 TFLOPS cold and 32.9 warm on `4096 x 2048 x 2048`. `cold=True` keeps that regime for the cases
-  where it is the real one, instead of making it the default.
-- it sizes its warmup by wall time, so a 100 ms kernel gets one warmup launch at best, and it sizes its
-  repetition the same way, so iteration counts swing by orders of magnitude across shapes.
+  streaming kernel and wrong for a model that calls the same weight repeatedly. `cold=True` keeps
+  that regime for the cases where it is the real one, instead of making it the default.
+- it sizes its warmup and repetition by wall time, so long kernels get too few launches and iteration
+  counts swing across shapes.
 - it times one provider at a time, so a clock change between providers looks like a difference between
   them.
-- it reports a single number, so a 1% change cannot be separated from noise.
+- it reports a single number, so a small change cannot be separated from noise.
 """
 
 import json
@@ -93,7 +92,7 @@ def time_fn(
     cold: bool = False,
 ) -> Measurement:
     """Time one provider. `target_ms` sets how long one round should take, so the iteration count
-    adapts from a 20 us kernel to a 200 ms one."""
+    adapts to both short and long kernels."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -132,9 +131,7 @@ def measure(
 
     Rotating rather than reversing is what makes the pairing honest: with `n` providers and `r` rounds, a
     provider sits at each position `floor(r / n)` times (more, up to one extra, when `r % n`), whereas a
-    reversal leaves the middle position owned by the same provider in every round. That bias is not
-    hypothetical - two providers that launch the same kernel measured 1.6% apart when one of them always
-    sat in the middle of a three-provider run.
+    reversal leaves the middle position owned by the same provider in every round.
     """
     names = list(providers)
     per_round: dict[str, list[float]] = {name: [] for name in names}

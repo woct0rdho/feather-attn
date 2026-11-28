@@ -17,6 +17,8 @@ SOURCES = [
     "csrc/fwd/fwd_fp8_key_tail.cu",
     "csrc/fwd/fwd_fp8_query_key_tail.cu",
     "csrc/fwd/fwd_fp8_strided.cu",
+    "csrc/fwd/bf16/bf16_fwd_d128.cpp",
+    "csrc/fwd/bf16/bf16_fwd_d128_image.cu",
     "csrc/bwd/bwd.cpp",
     "csrc/bwd/bwd_fused_d64.cu",
     "csrc/bwd/bwd_fused_d128.cu",
